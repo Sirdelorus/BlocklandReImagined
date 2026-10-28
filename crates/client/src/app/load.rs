@@ -98,7 +98,8 @@ impl App {
         let graphics = crate::graphics::Graphics::from_settings(&saved);
         let mut audio = crate::audio::ClientAudio::load(&content.paths.audio, &mut saved, output)?;
         audio.set_pack_sounds(&content.weapons.pack, &content.paths.weapons);
-        let voice = crate::voice::VoiceClient::new(&saved);
+        let mut brick_debris = crate::brick_debris::BrickDebris::new();
+        brick_debris.set_audio_policy(content.weapons.pack.effects.brick_debris_audio.as_ref());
         let platform = if cfg!(target_os = "macos") {
             Platform::MacOs
         } else {
@@ -186,8 +187,6 @@ impl App {
                 display_size: (1, 1),
             },
             audio,
-            voice,
-            voice_icons: Default::default(),
             ui,
             files: Saves {
                 saves: crate::saves::Store::new(state_dir, &content, Some(old_saves.clone())),
@@ -318,7 +317,7 @@ impl App {
                 casings_told: 0,
                 flash_cues: Vec::new(),
                 flash_showing: None,
-                brick_debris: Default::default(),
+                brick_debris,
                 ragdolls: Default::default(),
                 debris_models: Default::default(),
                 brick_fades: Default::default(),

@@ -482,7 +482,10 @@ impl App {
                     &view.world.palette,
                     show,
                     &fading,
-                    |id| debris.is_dead(id),
+                    |id| {
+                        debris.is_dead(id)
+                            || view.world.bricks.get(&id).is_some_and(|b| b.damage_hidden)
+                    },
                     |brick| {
                         crate::brick_cover::mesh(brick, meshes)
                             .map(|mesh| hidden_brick_box(brick, mesh))
@@ -514,6 +517,7 @@ impl App {
             }
             if let (Some(palette), Some(gpu_palette)) = (&self.scene.palette, &self.gpu.gpu_palette)
             {
+                let _span = crate::frame_trace::span("debris uploads");
                 self.fx.debris_models.upload(
                     &self.fx.brick_debris,
                     renderer,
@@ -531,6 +535,7 @@ impl App {
                 &self.scene.palette,
                 &self.gpu.gpu_palette,
             ) {
+                let _span = crate::frame_trace::span("brick fade uploads");
                 self.fx.fade_models.upload(
                     &self.fx.brick_fades,
                     &self.scene.chunks_left_out,
@@ -923,10 +928,10 @@ impl App {
         // its debris instead.
         let debris = &self.fx.brick_debris;
         let eye = glam::Vec4::from(camera.eye).truncate();
-        let mut mirrors = self
-            .scene
-            .mirror_index
-            .mirrors(|id| debris.is_dead(id), eye);
+        let mut mirrors = self.scene.mirror_index.mirrors(
+            |id| debris.is_dead(id) || view.world.bricks.get(&id).is_some_and(|b| b.damage_hidden),
+            eye,
+        );
         crate::mirrors::debris(debris, &self.scene.mirror_shapes, eye, &mut mirrors);
         reflections.prepare(
             frame.device,

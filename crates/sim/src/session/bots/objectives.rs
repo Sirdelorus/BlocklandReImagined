@@ -771,6 +771,15 @@ impl State {
                 }))
     }
     pub(super) fn fail(&mut self, tick: u64, reason: &'static str) {
+        self.fail_for(tick, reason, APPROACH_TIMEOUT * 2);
+    }
+    /// A route attempt failed, not the action's rules or capabilities.
+    /// Reaching a destination can work after a local replan; blacklisting
+    /// delivery for a minute makes a carrier abandon it to chase enemies.
+    pub(super) fn navigation_failed(&mut self, tick: u64, reason: &'static str) {
+        self.fail_for(tick, reason, UNREACHED_TICKS);
+    }
+    fn fail_for(&mut self, tick: u64, reason: &'static str, retry: u64) {
         self.paused = false;
         if let Some(step) = self.step.take() {
             self.failed.give_up(
@@ -782,7 +791,7 @@ impl State {
                     round: step.round,
                     team: step.team,
                 },
-                tick.saturating_add(APPROACH_TIMEOUT * 2),
+                tick.saturating_add(retry),
             );
         }
         self.route.clear();
@@ -855,7 +864,7 @@ impl BrickAction {
         let peer = session.peers.get(&bot)?;
         let feet = Vec3::from(peer.player.state().feet);
         let bounds = bri_world::regions::bounds(
-            session.simulation.state().bricks[&brick].rule_region,
+            session.simulation.state().bricks[&brick].rule_region(),
             (min, max),
         );
         let point = match method {
@@ -904,7 +913,7 @@ impl BrickAction {
                 destination,
                 rearming: touching,
                 bounds: (min, max),
-                region: session.simulation.state().bricks[&brick].rule_region,
+                region: session.simulation.state().bricks[&brick].rule_region(),
             },
             cost,
         ))
@@ -961,7 +970,7 @@ impl Executor {
                 .state()
                 .bricks
                 .get(&brick)
-                .is_some_and(|b| b.rule_region == action.region)
+                .is_some_and(|b| b.rule_region() == action.region)
     }
     fn provider(&self) -> &'static str {
         match self {
@@ -1005,7 +1014,7 @@ impl Executor {
         let outside = match action.method {
             BrickMethod::Region => {
                 let (lo, hi) = bri_world::regions::bounds(
-                    session.simulation.state().bricks[&brick].rule_region,
+                    session.simulation.state().bricks[&brick].rule_region(),
                     (lo, hi),
                 );
                 let p = Vec3::from(peer.player.state().feet) + Vec3::Y;

@@ -191,6 +191,12 @@ pub struct PlayerView {
     /// A bot's spawn brick's owner (`%bot.spawnBrick.client`), if any.
     #[serde(default)]
     pub bot_owner: Option<u64>,
+    /// The brick that spawned this bot, if any.
+    #[serde(default)]
+    pub bot_brick: Option<u64>,
+    /// The explicit Team choice on that spawn brick, if set.
+    #[serde(default)]
+    pub bot_spawn_team: Option<u64>,
     /// The package whose rules added this bot (`add_bot`), if a rule did
     /// rather than a spawn brick.
     #[serde(default)]
@@ -988,6 +994,16 @@ fn player_map(p: &PlayerView) -> Dynamic {
         (
             "spawner",
             p.spawner.clone().map_or(Dynamic::UNIT, Dynamic::from),
+        ),
+        (
+            "bot_brick",
+            p.bot_brick
+                .map_or(Dynamic::UNIT, |id| Dynamic::from_int(id as i64)),
+        ),
+        (
+            "bot_spawn_team",
+            p.bot_spawn_team
+                .map_or(Dynamic::UNIT, |id| Dynamic::from_int(id as i64)),
         ),
         (
             "riding",
@@ -4791,6 +4807,17 @@ impl Runtime {
                 (behaviour.on_bot_friend_died, "on_bot_friend_died", 2),
                 (behaviour.on_bot_lost_enemy, "on_bot_lost_enemy", 2),
                 (behaviour.on_bot_out_of_ammo, "on_bot_out_of_ammo", 1),
+                (
+                    behaviour.on_bot_objective_acquired,
+                    "on_bot_objective_acquired",
+                    1,
+                ),
+                (
+                    behaviour.on_bot_objective_completed,
+                    "on_bot_objective_completed",
+                    1,
+                ),
+                (behaviour.on_bot_stalled, "on_bot_stalled", 1),
             ] {
                 if declared {
                     need(name.into(), arity, name);

@@ -19,6 +19,15 @@
 //! are alive at once; the oldest make way for new ones. The player picks the
 //! bound with Options' Physics Quality; nothing else thins the debris (Max,
 //! 2026-10-04: a little lag over less destruction).
+//!
+//! Bricks behave as plastic ([`PLASTIC_BOUNCE`], [`PLASTIC_FRICTION`]), with
+//! v20's throws. Where this departs from real plastic, it is on purpose:
+//! outcomes real plastic rarely shows come up often enough to be seen,
+//! never bigger than real (Max, 2026-10-27). The departures, all here:
+//! - A quarter of eligible direct hits crack into shards
+//!   ([`crate::brick_shards`]); real plastic usually survives a blow. The
+//!   bricks around it, the common case, pop off whole as plastic does.
+use crate::brick_shards::{Crack, Shard, cracks, shard_scene, shards};
 use crate::building::Building;
 use crate::local_physics::{MAX_STEPS, PUSHER_REACH, Pushers, STEP, Shots, Surroundings};
 pub use crate::local_physics::{Pusher, Shot};
@@ -32,6 +41,10 @@ use bri_world::{BrickId, ContentRef};
 use glam::{Mat4, Quat, Vec3};
 use rapier3d::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::f32::consts::FRAC_PI_2;
+mod foley;
+mod sections;
+use sections::{Section, SectionPiece};
 
 /// The limit a player who never chose gets: v20's default Physics Quality,
 /// High (see [`bri_ui::screens::options::debris_limit`]).
@@ -52,18 +65,38 @@ const FORCE_TO_SPEED: f32 = 0.5;
 const MAX_SPEED: f32 = 40.0;
 /// Cosmetic explosion cues waiting for the next debris frame.
 const MAX_BLASTS: usize = 64;
+/// Uncommon cracks change variety, never the weapon's radius or force.
+const SHARD_CHANCE: f32 = 0.25;
+fn cracks_on_hit(cue: u64) -> bool {
+    Seeded::new(!cue).unit() < SHARD_CHANCE
+}
 /// Bodies are a hair smaller than the brick so neighbours killed together
 /// don't start out interpenetrating.
 const BODY_SHRINK: f32 = 0.96;
 /// Momentum a projectile gives each body it passes, per unit of speed.
 const PROJECTILE_MASS: f32 = 0.2;
+/// How much of its speed a plastic brick keeps bouncing off something
+/// hard: plastic on steel keeps 0.45 to 0.55
+/// (<https://www.samaterials.com/content/coefficient-of-restitution.html>).
+/// The map, bricks and terrain carry no bounce of their own, so the
+/// debris' own is the one that counts (`CoefficientCombineRule::Max`).
+const PLASTIC_BOUNCE: f32 = 0.5;
+/// Plastic sliding on plastic: polystyrene on polystyrene grips at 0.5
+/// (<https://blog.misumiusa.com/coefficient-of-friction/>); LEGO's ABS is a
+/// styrene plastic.
+const PLASTIC_FRICTION: f32 = 0.5;
 /// Mass per cubic unit of debris: a 2x4 brick weighs 6.
 const DENSITY: f32 = 5.0;
+/// Debris is a visual response, not a gameplay stack or joint mechanism.
+/// Two constraint iterations retain contact/CCD at 120 Hz while reducing the
+/// cost of dense piles and four-step catch-up frames. Server physics keeps its
+/// own defaults; Physics Quality still controls body count, not visibility.
+const COSMETIC_SOLVER_ITERATIONS: usize = 2;
 /// Distinct brick looks kept on the GPU.
 const MAX_LOOKS: usize = 64;
 /// Most instances one look draws: bodies and ghosts within the limit, plus
 /// falling bricks.
-const MAX_INSTANCES: usize = 3 * MAX_LIMIT;
+const MAX_INSTANCES: usize = sections::MAX_VISIBLE + 3 * MAX_LIMIT;
 
 // A killed brick, from `blocklandv20.exe`: the fxDTSBrick death update
 // (0x5399a8-0x539c0a) throws it; its advance (0x53cfa9-0x53d11c) moves it
@@ -91,15 +124,27 @@ pub struct Look {
     pub color_effect: u8,
     pub shape_effect: u8,
     pub print: Option<ContentRef>,
+    /// One shard of a cracked brick: its own model, worn by one body.
+    pub shard: Option<ShardLook>,
 }
+/// Which shard of which cracked brick a look draws.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardLook {
+    /// The cue that cracked it: no other brick shares its cracks.
+    pub cue: u64,
+    pub index: u8,
+    pub cracks: Vec<Crack>,
+}
+type LookKey<'a> = (&'a str, u8, u8, u8, Option<String>, Option<(u64, u8)>);
 impl Look {
-    fn key(&self) -> (&str, u8, u8, u8, Option<String>) {
+    fn key(&self) -> LookKey<'_> {
         (
             &self.definition,
             self.color,
             self.color_effect,
             self.shape_effect,
             self.print.as_ref().map(|p| format!("{p:?}")),
+            self.shard.as_ref().map(|s| (s.cue, s.index)),
         )
     }
 }
@@ -117,9 +162,11 @@ impl Ord for Look {
 
 struct Body {
     handle: RigidBodyHandle,
+    #[allow(dead_code)]
     brick: BrickId,
     look: Look,
     age: f32,
+    collision: crate::local_physics::CollisionWindow,
 }
 impl Body {
     /// How opaque the body is at its age.
@@ -132,6 +179,7 @@ impl Body {
 /// fall straight through everything while it fades. It moves in closed
 /// form, so every frame rate draws the same path.
 struct Falling {
+    #[allow(dead_code)]
     brick: BrickId,
     look: Look,
     start: Vec3,
@@ -204,14 +252,23 @@ pub struct DebrisWork {
 
 pub struct BrickDebris {
     world: PhysicsWorld,
-    /// Keyed by cue id, so iteration runs oldest first.
-    bodies: BTreeMap<u64, Body>,
+    /// Keyed by cue id and piece (a cracked brick's shards), so iteration
+    /// runs oldest first.
+    bodies: BTreeMap<(u64, u8), Body>,
+    sections: BTreeMap<(u64, u64), Section>,
+    section_barriers: BTreeMap<(u64, u64), (usize, u64)>,
+    retired_sections: BTreeSet<(u64, u64)>,
+    section_shots: sections::shots::Queries,
+    section_turn: usize,
+    body_turn: usize,
     surroundings: Surroundings,
+    foley: foley::Foley,
     /// Bricks this client saw die that have not come back yet.
     dead: BTreeSet<BrickId>,
     cursor: u64,
     explosion_cursor: u64,
     pending_blasts: Vec<CosmeticBlast>,
+    recent_blasts: std::collections::VecDeque<CosmeticBlast>,
     accumulator: f32,
     pushers: Pushers,
     shots: Shots,
@@ -232,14 +289,24 @@ impl Default for BrickDebris {
 
 impl BrickDebris {
     pub fn new() -> Self {
+        let mut world = crate::local_physics::new_world();
+        world.integration_parameters.num_solver_iterations = COSMETIC_SOLVER_ITERATIONS;
         Self {
-            world: crate::local_physics::new_world(),
+            world,
             bodies: BTreeMap::new(),
+            sections: BTreeMap::new(),
+            section_barriers: BTreeMap::new(),
+            retired_sections: BTreeSet::new(),
+            section_shots: Default::default(),
+            section_turn: 0,
+            body_turn: 0,
             surroundings: Surroundings::default(),
+            foley: Default::default(),
             dead: BTreeSet::new(),
             cursor: 0,
             explosion_cursor: 0,
             pending_blasts: Vec::new(),
+            recent_blasts: std::collections::VecDeque::new(),
             accumulator: 0.0,
             pushers: Pushers::default(),
             shots: Shots::default(),
@@ -260,8 +327,29 @@ impl BrickDebris {
     /// Forget everything (disconnect, new server). The limit stays.
     pub fn clear(&mut self) {
         let limit = self.limit;
+        let policy = self.foley.policy.clone();
         *self = Self::new();
         self.set_limit(limit);
+        self.set_audio_policy(policy.as_deref());
+    }
+    pub fn set_audio_policy(&mut self, policy: Option<&bri_weapons::brick_audio::Policy>) {
+        self.foley.set_policy(policy);
+        let handles: Vec<_> = self
+            .bodies
+            .values()
+            .map(|b| b.handle)
+            .chain(self.chunk_handles())
+            .collect();
+        for h in handles {
+            foley::configure(&mut self.world, h, policy);
+            self.foley.born(h, 0.12);
+        }
+    }
+    pub fn set_audio_listener(&mut self, position: Vec3) {
+        self.foley.ear = position;
+    }
+    pub fn take_audio(&mut self) -> Vec<foley::Playback> {
+        self.foley.take()
     }
     /// Keep at most `limit` bodies (clamped to [`MAX_LIMIT`]); extra bodies
     /// go now, oldest first.
@@ -272,11 +360,26 @@ impl BrickDebris {
     pub fn limit(&self) -> usize {
         self.limit
     }
+    /// CPU-only tests have no renderer. The live adapter gates a newly sealed
+    /// section until its bounded render uploads have caught up.
+    pub fn prepare_models(&mut self, models: &DebrisModels) {
+        for section in self.sections.values_mut() {
+            if section.age > 0. {
+                continue;
+            }
+            section.gpu_ready = section
+                .pieces
+                .iter()
+                .all(|p| models.models.contains_key(&p.look));
+        }
+    }
     /// Remove the oldest bodies until at most `keep` remain; returns how
     /// many went. Bodies already seen fade out as ghosts; ones killed and
     /// removed before a frame drew them just go.
     fn evict_to(&mut self, keep: usize) -> u64 {
         let mut gone = 0;
+        gone += self.freeze_chunks(keep);
+        let keep = keep.saturating_sub(self.chunk_handles().count());
         while self.bodies.len() > keep {
             let (_, oldest) = self.bodies.pop_first().expect("bodies over the limit");
             let rb = &self.world.bodies[oldest.handle];
@@ -305,10 +408,10 @@ impl BrickDebris {
         self.falling.len()
     }
     pub fn len(&self) -> usize {
-        self.bodies.len()
+        self.bodies.len() + self.chunk_handles().count()
     }
     pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
+        self.bodies.is_empty() && self.section_piece_count() == 0
     }
     /// Whether `brick` died (or was fake-killed) and hasn't come back. Such
     /// bricks are not "hidden" bricks the building tools reveal.
@@ -369,14 +472,52 @@ impl BrickDebris {
         building: &Building,
     ) -> Result<usize> {
         let mut spawned = 0;
+        let mut sections: BTreeMap<(u64, u64), Vec<SectionPiece>> = BTreeMap::new();
         let explosions = std::mem::take(&mut self.pending_blasts);
         for blast in &explosions {
             self.blast(blast.origin, blast.force, blast.radius, blast.normal);
+        }
+        // Removal work can complete in a later packet/tick than its explosion.
+        // Keep that bounded presentation context without replaying its impulse.
+        self.recent_blasts.extend(explosions.iter().copied());
+        while self.recent_blasts.len() > MAX_BLASTS {
+            self.recent_blasts.pop_front();
         }
         // One blast kills many bricks, one cue each: it shoves the debris
         // already flying once, not once per brick it killed.
         let mut last_blast = None;
         for cue in cues {
+            if let CueKind::BrickSectionRetired { started, group } = cue.kind {
+                cue.validate()?;
+                let key = (started, group);
+                self.retired_sections.insert(key);
+                while self.retired_sections.len() > 1024 {
+                    self.retired_sections.pop_first();
+                }
+                self.retire_section(key);
+                self.section_barriers.remove(&key);
+                continue;
+            }
+            if let CueKind::BrickSectionReady {
+                started,
+                group,
+                members,
+            } = cue.kind
+            {
+                cue.validate()?;
+                let key = (started, group);
+                if self.retired_sections.contains(&key) {
+                    continue;
+                }
+                self.section_barriers
+                    .insert(key, (members as usize, cue.tick));
+                if let Some(section) = self.sections.get_mut(&key) {
+                    section.expected = members as usize;
+                    section.barrier_tick = Some(cue.tick);
+                    section.sealed = section.pieces.len() == members as usize;
+                }
+                continue;
+            }
             let CueKind::BrickKill {
                 brick,
                 death,
@@ -406,14 +547,54 @@ impl BrickDebris {
                 self.diagnostics.unknown += 1;
                 continue;
             };
-            self.dead.insert(*brick);
+            if !building.restored_after(*brick, cue.tick) {
+                self.dead.insert(*brick);
+            }
+            if *death == BrickDeath::Partition {
+                self.surroundings.forget_brick(&mut self.world, *brick);
+                spawned += 1;
+                continue;
+            }
             let look = Look {
                 definition: definition.clone(),
                 color: *color,
                 color_effect: *color_effect,
                 shape_effect: *shape_effect,
                 print: print.clone(),
+                shard: None,
             };
+            if let BrickDeath::Section {
+                group,
+                started,
+                members,
+                half: section_half,
+                pivot,
+            } = death
+            {
+                self.surroundings.forget_brick(&mut self.world, *brick);
+                sections
+                    .entry((*started, *group))
+                    .or_default()
+                    .push(SectionPiece {
+                        brick: *brick,
+                        look,
+                        offset: Vec3::from(cue.position),
+                        turn: Quat::from_rotation_y(-f32::from(*quarter_turns) * FRAC_PI_2),
+                        half,
+                        origin: Vec3::from(*origin),
+                        tick: cue.tick,
+                        active: !building.section_source_retired_after(
+                            *brick,
+                            cue.tick,
+                            [*started, *group],
+                        ),
+                        members: *members as usize,
+                        section_half: Vec3::from(*section_half),
+                        pivot: Vec3::from(*pivot),
+                    });
+                spawned += 1;
+                continue;
+            }
             if *death == BrickDeath::Kill {
                 if self.falling.len() >= MAX_FALLING {
                     self.diagnostics.skipped += 1;
@@ -433,9 +614,17 @@ impl BrickDebris {
             }
             // A big blast also shoves the debris already flying around it.
             let blast = (*origin, *force, *radius);
-            let explosion = explosions
+            let explosion = self
+                .recent_blasts
                 .iter()
-                .find(|b| b.tick == cue.tick && b.origin == Vec3::from(*origin));
+                .rev()
+                .find(|b| {
+                    b.tick <= cue.tick
+                        && cue.tick - b.tick
+                            <= (SOLID_SECONDS * bri_world::TICKS_PER_SECOND as f32) as u64
+                        && b.origin == Vec3::from(*origin)
+                })
+                .copied();
             if *radius > 0.5 && last_blast != Some(blast) && explosion.is_none() {
                 self.blast(Vec3::from(*origin), *force, *radius, None);
             }
@@ -446,20 +635,70 @@ impl BrickDebris {
                 self.diagnostics.skipped += 1;
                 continue;
             }
-            self.spawn(
-                cue.id,
-                *brick,
-                look,
-                Vec3::from(cue.position),
-                *quarter_turns,
-                half,
-                Vec3::from(*origin),
-                *force,
-                *radius,
-                explosion.filter(|_| *radius > 1.0).and_then(|b| b.normal),
-            );
+            // A plain brick struck directly cracks, when the limit has
+            // room for its shards.
+            let center = Vec3::from(cue.position);
+            let turn = Quat::from_rotation_y(-f32::from(*quarter_turns) * FRAC_PI_2);
+            let available = self.limit.saturating_sub(self.chunk_handles().count());
+            if available == 0 {
+                self.diagnostics.skipped += 1;
+                continue;
+            }
+            let cracked = match building.definition(definition) {
+                Some(d)
+                    if *death == BrickDeath::Hit && cracks_on_hit(cue.id) && d.is_plain_box() =>
+                {
+                    let mut rng = Seeded::new(!cue.id);
+                    rng.next(); // The selection draw must not bias crack geometry.
+                    let impact = turn.inverse() * (Vec3::from(*origin) - center);
+                    let cracks = cracks(&d.mesh, impact, || rng.signed());
+                    let pieces = shards(half, &cracks);
+                    if pieces.len() > 1 && pieces.len() <= available {
+                        Some((cracks, pieces))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let pieces: Vec<(Look, Option<Shard>)> = match cracked {
+                None => vec![(look, None)],
+                Some((cracks, pieces)) => pieces
+                    .into_iter()
+                    .map(|shard| {
+                        let look = Look {
+                            shard: Some(ShardLook {
+                                cue: cue.id,
+                                index: shard.index,
+                                cracks: cracks.clone(),
+                            }),
+                            ..look.clone()
+                        };
+                        (look, Some(shard))
+                    })
+                    .collect(),
+            };
+            self.diagnostics.evicted += self.evict_to(self.limit - pieces.len());
+            for (piece, (look, shard)) in pieces.into_iter().enumerate() {
+                self.spawn(
+                    (cue.id, piece as u8),
+                    *brick,
+                    look,
+                    center,
+                    turn,
+                    half,
+                    shard,
+                    Vec3::from(*origin),
+                    *force,
+                    *radius,
+                    explosion.filter(|_| *radius > 1.0).and_then(|b| b.normal),
+                );
+            }
             self.diagnostics.accepted += 1;
             spawned += 1;
+        }
+        for (key, pieces) in sections {
+            self.add_section(key, pieces, building)?;
         }
         Ok(spawned)
     }
@@ -499,22 +738,26 @@ impl BrickDebris {
             age: 0.0,
         });
     }
+    /// Throw one piece of a blasted brick: the whole brick, or one `shard`
+    /// of it. The caller has made room within the limit. The whole brick's
+    /// throw (piece 0) is seeded by its cue alone, as v20 debris always was.
     #[allow(clippy::too_many_arguments)] // one cue's fields
     fn spawn(
         &mut self,
-        id: u64,
+        (id, piece): (u64, u8),
         brick: BrickId,
         look: Look,
-        center: Vec3,
-        quarter_turns: u8,
+        brick_center: Vec3,
+        turn: Quat,
         half: Vec3,
+        shard: Option<Shard>,
         origin: Vec3,
         force: f32,
         radius: f32,
         normal: Option<Vec3>,
     ) {
-        self.diagnostics.evicted += self.evict_to(self.limit - 1);
-        let mut rng = Seeded::new(id);
+        let mut rng = Seeded::new(id ^ u64::from(piece) << 56);
+        let center = brick_center + turn * shard.as_ref().map_or(Vec3::ZERO, |s| s.center);
         let offset = center - origin;
         let distance = offset.length();
         let direction = if distance > 1e-4 {
@@ -551,9 +794,7 @@ impl BrickDebris {
         velocity = velocity.clamp_length_max(MAX_SPEED);
         let spin = Vec3::new(rng.signed(), rng.signed(), rng.signed()).normalize_or(Vec3::X)
             * (2.0 + 6.0 * rng.unit());
-        let rotation = Rotation::from_scaled_axis(
-            Vector::Y * (-f32::from(quarter_turns) * std::f32::consts::FRAC_PI_2),
-        );
+        let rotation = Rotation::from_array(turn.to_array());
         let body = RigidBodyBuilder::dynamic()
             .pose(Pose::from_parts(
                 Vector::from_array(center.to_array()),
@@ -565,24 +806,40 @@ impl BrickDebris {
             .angular_damping(0.4)
             .ccd_enabled(true);
         let h = half * BODY_SHRINK;
-        let collider = ColliderBuilder::cuboid(h.x.max(0.01), h.y.max(0.01), h.z.max(0.01))
+        let hull = shard.and_then(|s| {
+            let points: Vec<Vector> = s
+                .hull
+                .iter()
+                .map(|p| Vector::from_array((*p * BODY_SHRINK).to_array()))
+                .collect();
+            ColliderBuilder::convex_hull(&points)
+        });
+        let collider = hull
+            .unwrap_or_else(|| ColliderBuilder::cuboid(h.x.max(0.01), h.y.max(0.01), h.z.max(0.01)))
             .density(DENSITY)
-            .friction(0.7)
-            .restitution(0.25);
+            .friction(PLASTIC_FRICTION)
+            .restitution(PLASTIC_BOUNCE)
+            .restitution_combine_rule(CoefficientCombineRule::Max);
         let (handle, _) = self.world.insert(body, collider);
+        foley::configure(&mut self.world, handle, self.foley.policy.as_deref());
+        self.foley.born(handle, 0.);
+        self.world.bodies[handle].set_enabled(false);
         self.bodies.insert(
-            id,
+            (id, piece),
             Body {
                 handle,
                 brick,
                 look,
                 age: 0.0,
+                collision: Default::default(),
             },
         );
     }
     /// Advance debris by `dt` seconds against the current surroundings.
     pub fn advance(&mut self, dt: f32, building: &Building) -> Result<()> {
         ensure!(dt.is_finite() && dt >= 0.0, "Invalid debris frame time");
+        let started = std::time::Instant::now();
+        self.foley.begin(dt);
         for falling in &mut self.falling {
             falling.age += dt;
         }
@@ -596,15 +853,33 @@ impl BrickDebris {
         // Lifetimes run on frame time, not simulated steps: a slow frame
         // drops steps, and debris must not outlive its time because of it.
         self.age(dt);
-        if self.bodies.is_empty() {
+        let surroundings_span = crate::frame_trace::span("debris surroundings");
+        if self.surroundings.sync(&mut self.world, building) {
+            self.world.wake_up_all(true);
+        }
+        drop(surroundings_span);
+        if self.surroundings.full()
+            && self
+                .bodies
+                .values()
+                .map(|b| b.handle)
+                .chain(self.chunk_handles())
+                .all(|h| !self.world.bodies[h].is_enabled())
+        {
+            self.surroundings.clear(&mut self.world);
+            for b in self.bodies.values_mut() {
+                b.collision.reset();
+            }
+            self.reset_section_collision();
+        }
+        let sections_span = crate::frame_trace::span("debris assemblies");
+        self.advance_sections(dt, building)?;
+        drop(sections_span);
+        if self.bodies.is_empty() && self.section_piece_count() == 0 {
             self.accumulator = 0.0;
             self.surroundings.clear(&mut self.world);
             self.pushers.clear(&mut self.world);
             return Ok(());
-        }
-        // Bricks changed: resting debris looks again for its support.
-        if self.surroundings.sync(&mut self.world, building) {
-            self.world.wake_up_all(true);
         }
         self.accumulator += dt;
         let mut steps = (self.accumulator / STEP) as u32;
@@ -618,32 +893,60 @@ impl BrickDebris {
         if steps == 0 {
             return Ok(());
         }
-        self.load_surroundings(building, steps as f32 * STEP)?;
+        let contacts = self.foley.collector();
         for step in 1..=steps {
+            let collision_span = crate::frame_trace::span("debris collision preparation");
+            self.load_surroundings(building, STEP)?;
+            drop(collision_span);
             self.pushers
                 .drive(&mut self.world, step as f32 / steps as f32);
             let before = match self.passages.list.is_empty() {
                 true => Vec::new(),
                 false => crate::local_physics::middles(
                     &self.world,
-                    self.bodies.values().map(|b| b.handle),
+                    self.bodies
+                        .values()
+                        .map(|b| b.handle)
+                        .chain(self.chunk_handles()),
                 ),
             };
-            self.world.step();
+            let simulation_span = crate::frame_trace::span("debris simulation");
+            if let Some(contacts) = &contacts {
+                self.world.step_with_events(&(), contacts);
+            } else {
+                self.world.step();
+            }
+            drop(simulation_span);
             crate::local_physics::carry_through_openings(&mut self.world, &self.passages, &before);
         }
+        if let Some(contacts) = contacts {
+            for hit in contacts.take() {
+                self.foley.report(hit);
+            }
+        }
         self.pushers.settle();
+        if started.elapsed() >= std::time::Duration::from_millis(8) {
+            crate::frame_trace::note(format!(
+                "debris: {} loose bodies, {} chunk bodies, {} section members, {steps} fixed steps",
+                self.bodies.len(),
+                self.chunk_handles().count(),
+                self.section_piece_count(),
+            ));
+        }
         Ok(())
     }
     /// Where players and vehicles are this frame. Call before `advance`.
     /// Only those near debris take part; they are kinematic, so debris
     /// moves out of their way and never moves them.
     pub fn push(&mut self, pushers: &[Pusher]) {
-        let (world, bodies) = (&mut self.world, &self.bodies);
-        let centers: Vec<Vec3> = bodies
+        let centers: Vec<Vec3> = self
+            .bodies
             .values()
-            .map(|b| Vec3::from_array(world.bodies[b.handle].translation().to_array()))
+            .map(|b| b.handle)
+            .chain(self.chunk_handles())
+            .map(|h| Vec3::from_array(self.world.bodies[h].translation().to_array()))
             .collect();
+        let world = &mut self.world;
         self.pushers.update(world, pushers, |p| {
             let reach = PUSHER_REACH + p.half.max_element();
             centers.iter().any(|c| c.distance(p.center) < reach)
@@ -652,20 +955,50 @@ impl BrickDebris {
     /// Projectiles as drawn this frame. Each pushes every body it passes
     /// through once, and flies on as if the debris were not there.
     pub fn shots(&mut self, shots: &[Shot]) {
-        let owners: HashMap<RigidBodyHandle, u64> =
-            self.bodies.iter().map(|(id, b)| (b.handle, *id)).collect();
+        let chunks: Vec<_> = self.chunk_handles().collect();
+        let owners: HashMap<RigidBodyHandle, u64> = self
+            .bodies
+            .values()
+            .map(|b| b.handle)
+            .chain(self.chunk_handles())
+            .map(|handle| {
+                let (index, generation) = handle.0.into_raw_parts();
+                (handle, u64::from(generation) << 32 | u64::from(index))
+            })
+            .collect();
         for strike in self.shots.strike(&self.world, shots, &owners) {
             let rb = &mut self.world.bodies[strike.handle];
-            let impulse = strike.direction * PROJECTILE_MASS * strike.speed;
+            // Grouping must not make a hit disappear into a huge proxy mass.
+            // A restrained minimum jolt is cosmetic; the server shot continues.
+            let impulse_size =
+                (PROJECTILE_MASS * strike.speed).max(if chunks.contains(&strike.handle) {
+                    rb.mass() * 3.
+                } else {
+                    0.
+                });
+            let impulse = strike.direction * impulse_size;
             rb.apply_impulse_at_point(
                 Vector::from_array(impulse.to_array()),
                 Vector::from_array(strike.point.to_array()),
                 true,
             );
             let v = Vec3::from_array(rb.linvel().to_array()).clamp_length_max(MAX_SPEED);
+            if !rb.is_enabled() {
+                rb.set_translation(
+                    rb.translation() + Vector::from_array((strike.direction * 0.15).to_array()),
+                    true,
+                );
+            }
             rb.set_linvel(Vector::from_array(v.to_array()), true);
             self.diagnostics.projectile_hits += 1;
         }
+        self.section_shots
+            .enqueue(&self.sections, &self.world, &self.shots);
+        self.section_shots.step(
+            &mut self.sections,
+            &self.world,
+            &mut self.diagnostics.projectile_hits,
+        );
     }
     /// Shove every body within `radius` of `origin` away from it.
     fn blast(&mut self, origin: Vec3, force: f32, radius: f32, normal: Option<Vec3>) {
@@ -677,8 +1010,14 @@ impl BrickDebris {
         {
             return;
         }
-        for body in self.bodies.values() {
-            let rb = &mut self.world.bodies[body.handle];
+        let handles: Vec<_> = self
+            .bodies
+            .values()
+            .map(|b| b.handle)
+            .chain(self.chunk_handles())
+            .collect();
+        for handle in handles {
+            let rb = &mut self.world.bodies[handle];
             let at = Vec3::from_array(rb.translation().to_array());
             let offset = at - origin;
             let distance = offset.length();
@@ -713,43 +1052,46 @@ impl BrickDebris {
     }
     /// Make bricks and terrain around every awake body solid for the next
     /// `seconds` of motion.
-    fn load_surroundings(&mut self, building: &Building, seconds: f32) -> Result<()> {
-        let boxes: Vec<_> = self
-            .bodies
-            .values()
-            .map(|body| &self.world.bodies[body.handle])
-            .filter(|rb| !rb.is_sleeping())
-            .map(|rb| {
-                Surroundings::reach(
-                    Vec3::from_array(rb.translation().to_array()),
-                    Vec3::from_array(rb.linvel().to_array()),
-                    0.0,
-                    seconds,
-                )
-            })
-            .collect();
+    fn load_surroundings(&mut self, building: &Building, _seconds: f32) -> Result<()> {
+        let mut work = 128 * crate::local_physics::COLLISION_QUERY_COST;
         let dead = &self.dead;
-        self.surroundings
-            .load(&mut self.world, building, &boxes, |id| dead.contains(&id))?;
+        let mut keys: Vec<_> = self.bodies.keys().copied().collect();
+        if !keys.is_empty() {
+            let offset = self.body_turn % keys.len();
+            keys.rotate_left(offset);
+            self.body_turn = self.body_turn.wrapping_add(1);
+        }
+        for key in keys {
+            let body = self.bodies.get_mut(&key).unwrap();
+            let rb = &self.world.bodies[body.handle];
+            if rb.is_sleeping() && body.collision.unchanged(building) {
+                continue;
+            }
+            let collider = &self.world.colliders[rb.colliders()[0]];
+            let aabb = collider.compute_aabb();
+            let motion = crate::local_physics::CollisionMotion {
+                center: Vec3::from_array(rb.translation().to_array()),
+                half: Vec3::from_array(aabb.half_extents().to_array()),
+                velocity: Vec3::from_array(rb.linvel().to_array()),
+                angular: rb.angvel().length(),
+            };
+            let ready = body.collision.prepare(
+                &mut self.surroundings,
+                &mut self.world,
+                building,
+                motion,
+                &mut work,
+                |id| dead.contains(&id),
+            )?;
+            self.world.bodies[body.handle].set_enabled(ready);
+        }
         Ok(())
     }
     /// Forget deaths the world has since undone (respawned bricks) or made
     /// permanent (removed bricks).
     pub fn sync_world(&mut self, world: &PublicWorld) {
-        let alive: BTreeSet<BrickId> = self
-            .bodies
-            .values()
-            .map(|b| b.brick)
-            .chain(self.falling.iter().map(|f| f.brick))
-            .collect();
-        // A cue can arrive before the brick change it announces, so a
-        // brick with live debris counts as dead even while still visible.
-        self.dead.retain(|id| {
-            world
-                .bricks
-                .get(id)
-                .is_some_and(|b| !b.visible || alive.contains(id))
-        });
+        self.dead
+            .retain(|id| world.bricks.get(id).is_some_and(|b| b.damage_hidden));
     }
     /// World transform and fade of every body and falling brick, by look.
     pub fn instances(&self) -> impl Iterator<Item = (&Look, SceneTransform)> {
@@ -788,17 +1130,24 @@ impl BrickDebris {
                 },
             )
         });
-        bodies.chain(ghosts).chain(falling)
+        bodies
+            .chain(ghosts)
+            .chain(falling)
+            .chain(self.section_instances())
     }
     /// What the physics has to chew on right now, for probes.
     pub fn work(&self) -> DebrisWork {
         DebrisWork {
-            bodies: self.bodies.len(),
+            bodies: self.bodies.len() + self.chunk_handles().count(),
             awake: self
                 .bodies
                 .values()
                 .filter(|b| !self.world.bodies[b.handle].is_sleeping())
-                .count(),
+                .count()
+                + self
+                    .chunk_handles()
+                    .filter(|&h| !self.world.bodies[h].is_sleeping())
+                    .count(),
             statics: self.surroundings.len(),
             touching: self
                 .world
@@ -858,7 +1207,7 @@ impl DebrisModels {
         colors: &[[f32; 4]],
     ) -> Result<()> {
         let (mut built, mut images) = (0, 0);
-        let framed = self.frame_models(debris.instances(), colors.len(), |look| {
+        let framed = self.frame_models(debris.instances(), colors.len(), 4, |look| {
             let data = look_scene(look, meshes, palette, materials, colors)
                 .with_context(|| format!("Debris model for {}", look.definition))?;
             data.map(|data| {
@@ -902,6 +1251,7 @@ impl DebrisModels {
         &mut self,
         instances: impl Iterator<Item = (&'a Look, SceneTransform)>,
         colors: usize,
+        mut builds: usize,
         mut build: impl FnMut(&Look) -> Result<Option<GpuScene>>,
     ) -> Result<()> {
         self.frame += 1;
@@ -924,6 +1274,10 @@ impl DebrisModels {
         }
         for (look, transform) in missing {
             if !self.models.contains_key(look) {
+                if builds == 0 {
+                    continue;
+                }
+                builds -= 1;
                 if self.models.len() >= MAX_LOOKS {
                     self.evict();
                 }
@@ -938,11 +1292,9 @@ impl DebrisModels {
                     },
                 );
             }
-            self.models
-                .get_mut(look)
-                .expect("model built above")
-                .transforms
-                .push(transform);
+            if let Some(model) = self.models.get_mut(look) {
+                model.transforms.push(transform);
+            }
         }
         Ok(())
     }
@@ -982,7 +1334,19 @@ fn look_scene(
     brick.color_effect = look.color_effect;
     brick.shape_effect = look.shape_effect;
     brick.print = look.print.clone();
-    let data = crate::world_chunks::build_brick(&brick, colors, meshes, palette, Some(materials))?;
+    let mut data =
+        crate::world_chunks::build_brick(&brick, colors, meshes, palette, Some(materials))?;
+    if let Some(cut) = &look.shard {
+        let half = meshes
+            .get(&look.definition)
+            .context("Unknown cracked brick")?
+            .half_size();
+        let shard = shards(half, &cut.cracks)
+            .into_iter()
+            .find(|s| s.index == cut.index)
+            .context("Shard outside its brick")?;
+        data = shard_scene(&data, half, &cut.cracks, &shard);
+    }
     Ok((!data.indices.is_empty()).then_some(data))
 }
 
@@ -1024,6 +1388,7 @@ pub(crate) mod tests {
             color_effect: 0,
             shape_effect: 0,
             print: None,
+            shard: None,
         };
         let body = SceneTransform {
             transform: Mat4::IDENTITY,
@@ -1032,7 +1397,7 @@ pub(crate) mod tests {
         let mut models = DebrisModels::default();
         let builds = std::cell::Cell::new(0);
         let frame = |models: &mut DebrisModels, looks: &[Look]| {
-            models.frame_models(looks.iter().map(|l| (l, body)), 4, |_| {
+            models.frame_models(looks.iter().map(|l| (l, body)), 4, usize::MAX, |_| {
                 builds.set(builds.get() + 1);
                 Ok(None)
             })
@@ -1172,7 +1537,10 @@ pub(crate) mod tests {
         assert_eq!((debris.len(), debris.falling()), (0, 1));
         assert!(debris.is_empty());
         debris.sync_world(&world);
-        assert!(debris.is_dead(7), "still dying while its brick is drawn");
+        assert!(
+            !debris.is_dead(7),
+            "authoritative restoration wins over old debris"
+        );
         let at = |d: &BrickDebris| d.instances().next().map(|(_, t)| t);
         let start = at(&debris).unwrap();
         assert_eq!(start.tint[3], 1.0);
@@ -1429,7 +1797,7 @@ pub(crate) mod tests {
             .cues(&[lying(1, [-1.0, 0.3, 0.0])], &building)
             .unwrap();
         run(&mut debris, &building, 0.5);
-        let handle = debris.bodies[&1].handle;
+        let handle = debris.bodies[&(1, 0)].handle;
         debris.world.bodies[handle].sleep();
         let cue = cosmetic_blast(2, Vec3::new(0.0, 0.3, 0.0), None);
         debris.explosion_cue(&cue, &pack);
@@ -1446,6 +1814,103 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn delayed_blast_members_keep_the_observed_wall_exit_direction() {
+        let (building, _) = building(&[(1, [0., 0.9, 0.]), (11, [0., 0.9, 1.])]);
+        let origin = Vec3::new(0., 0.9, -0.5);
+        let pack = cosmetic_blast_pack();
+        for scale in [0.5, 1., 2.] {
+            let mut debris = BrickDebris::new();
+            let mut effect = cosmetic_blast(1, origin, Some(Vec3::NEG_Z));
+            if let CueKind::WeaponEffect { scale: s, .. } = &mut effect.kind {
+                *s = scale;
+            }
+            debris.explosion_cue(&effect, &pack);
+            debris.cues(&[], &building).unwrap();
+            run(&mut debris, &building, 0.1);
+            let mut killed = kill(2, 1, [0., 0.9, 0.], origin.to_array(), 30., 3.);
+            killed.tick = 13;
+            debris.cues(&[killed], &building).unwrap();
+            let body = debris.bodies[&(2, 0)].handle;
+            let velocity = debris.world.bodies[body].linvel();
+            assert!(
+                velocity.z < -4.,
+                "late member sent into surviving wall: {velocity:?}"
+            );
+            run(&mut debris, &building, 0.5);
+            assert!(debris.positions()[0].z < -0.75);
+        }
+    }
+
+    #[test]
+    fn delayed_blast_context_expires_and_does_not_survive_session_reset() {
+        let (building, _) = building(&[]);
+        let pack = cosmetic_blast_pack();
+        let origin = Vec3::new(0., 0.9, -0.5);
+        for reset in [false, true] {
+            let mut d = BrickDebris::new();
+            d.explosion_cue(&cosmetic_blast(1, origin, Some(Vec3::NEG_Z)), &pack);
+            d.cues(&[], &building).unwrap();
+            assert_eq!(d.recent_blasts.len(), 1);
+            if reset {
+                d.clear();
+            }
+            let mut killed = kill(2, 1, [0., 0.9, 0.], origin.to_array(), 30., 3.);
+            killed.tick = if reset {
+                13
+            } else {
+                2 + (SOLID_SECONDS * bri_world::TICKS_PER_SECOND as f32) as u64
+            };
+            d.cues(&[killed], &building).unwrap();
+            let body = d.bodies[&(2, 0)].handle;
+            assert!(
+                d.world.bodies[body].linvel().z > 0.,
+                "stale surface direction reused"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_collision_tiles_notice_new_solids_outside_the_current_body_box() {
+        let (mut building, mut public) = building(&[]);
+        let mut surroundings = Surroundings::default();
+        let mut physics = crate::local_physics::new_world();
+        let mut window = crate::local_physics::CollisionWindow::default();
+        let mut prepare = |building: &Building| {
+            surroundings.sync(&mut physics, building);
+            let mut work = 8192;
+            assert!(
+                window
+                    .prepare(
+                        &mut surroundings,
+                        &mut physics,
+                        building,
+                        crate::local_physics::CollisionMotion {
+                            center: Vec3::new(0., 0.3, 0.),
+                            half: Vec3::new(0.5, 0.3, 0.5),
+                            velocity: Vec3::ZERO,
+                            angular: 0.
+                        },
+                        &mut work,
+                        |_| false
+                    )
+                    .unwrap()
+            );
+            surroundings.len()
+        };
+        assert_eq!(prepare(&building), 0);
+        // Inside the prepared tile but outside this body's short lookahead.
+        public.bricks.insert(
+            99,
+            bri_world::Brick::new(ContentRef::Resolved("brick".into()), [5., 0.3, 0.], 1),
+        );
+        building.sync_world(&public).unwrap();
+        assert_eq!(prepare(&building), 1);
+        public.bricks.remove(&99);
+        building.sync_world(&public).unwrap();
+        assert_eq!(prepare(&building), 0);
+    }
+
+    #[test]
     fn explosion_queue_is_bounded_and_does_not_double_kick_or_change_authored_throws() {
         let (building, _) = building(&[]);
         let pack = cosmetic_blast_pack();
@@ -1457,7 +1922,7 @@ pub(crate) mod tests {
             .unwrap();
         debris.explosion_cue(&cue, &pack);
         debris.cues(&[], &building).unwrap();
-        let handle = debris.bodies[&1].handle;
+        let handle = debris.bodies[&(1, 0)].handle;
         let once = debris.world.bodies[handle].linvel();
         let mut with_kills = BrickDebris::new();
         with_kills
@@ -1470,7 +1935,7 @@ pub(crate) mod tests {
                 &building,
             )
             .unwrap();
-        let handle = with_kills.bodies[&1].handle;
+        let handle = with_kills.bodies[&(1, 0)].handle;
         assert_eq!(with_kills.world.bodies[handle].linvel(), once);
 
         // Small authored fakeKill/direct throws retain their exact launch,
@@ -1484,8 +1949,8 @@ pub(crate) mod tests {
             let mut accompanied = BrickDebris::new();
             accompanied.explosion_cue(&cue, &pack);
             accompanied.cues(&[kill], &building).unwrap();
-            let a = authored.bodies[&3].handle;
-            let b = accompanied.bodies[&3].handle;
+            let a = authored.bodies[&(3, 0)].handle;
+            let b = accompanied.bodies[&(3, 0)].handle;
             assert_eq!(
                 authored.world.bodies[a].linvel(),
                 accompanied.world.bodies[b].linvel()
@@ -1496,7 +1961,7 @@ pub(crate) mod tests {
         }
         assert_eq!(debris.pending_blasts.len(), MAX_BLASTS);
         debris.cues(&[], &building).unwrap();
-        let rb = &debris.world.bodies[debris.bodies[&1].handle];
+        let rb = &debris.world.bodies[debris.bodies[&(1, 0)].handle];
         assert!(Vec3::from_array(rb.linvel().to_array()).length() <= MAX_SPEED + 1e-4);
         let mut unknown = cosmetic_blast(1000, origin, None);
         if let CueKind::WeaponEffect { definition, .. } = &mut unknown.kind {
@@ -1805,6 +2270,142 @@ pub(crate) mod tests {
         assert!(debris.positions().iter().all(|p| p.is_finite()));
     }
 
+    /// A rocket landing on the brick itself: `kill` with the blow on it.
+    fn hit(id: u64, brick: BrickId, at: [f32; 3], origin: [f32; 3]) -> Cue {
+        let mut cue = kill(id, brick, at, origin, 30.0, 0.02);
+        if let CueKind::BrickKill { death, .. } = &mut cue.kind {
+            *death = BrickDeath::Hit;
+        }
+        cue
+    }
+
+    fn mass(debris: &BrickDebris) -> f32 {
+        debris
+            .bodies
+            .values()
+            .map(|b| debris.world.bodies[b.handle].mass())
+            .sum()
+    }
+
+    #[test]
+    fn a_struck_brick_cracks_into_shards_that_weigh_what_it_did() {
+        let (building, _) = building(&[]);
+        let mut whole = BrickDebris::new();
+        whole
+            .cues(
+                &[kill(1, 1, [0.0, 0.3, 0.0], [0.2, 0.6, 0.1], 30.0, 0.02)],
+                &building,
+            )
+            .unwrap();
+        let mut cracked = BrickDebris::new();
+        cracked
+            .cues(&[hit(4, 1, [0.0, 0.3, 0.0], [0.2, 0.6, 0.1])], &building)
+            .unwrap();
+        assert_eq!(whole.len(), 1, "a blast beside it throws it whole");
+        // A 2x2 brick cracks once each way.
+        assert_eq!(cracked.len(), 4);
+        assert!((mass(&cracked) - mass(&whole)).abs() < mass(&whole) * 0.01);
+        let looks: BTreeSet<_> = cracked
+            .bodies
+            .values()
+            .map(|b| b.look.shard.as_ref().map(|s| s.index))
+            .collect();
+        assert_eq!(looks.len(), 4, "each shard wears its own model");
+        // They fly apart from where it was struck, and every client sees
+        // the same pieces go the same way.
+        let mut again = BrickDebris::new();
+        again
+            .cues(&[hit(4, 1, [0.0, 0.3, 0.0], [0.2, 0.6, 0.1])], &building)
+            .unwrap();
+        run(&mut cracked, &building, 0.5);
+        run(&mut again, &building, 0.5);
+        assert_eq!(cracked.positions(), again.positions());
+        let spread = cracked.positions();
+        for (i, a) in spread.iter().enumerate() {
+            for b in &spread[i + 1..] {
+                assert!(a.distance(*b) > 0.3, "shards stuck together: {a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn shards_live_within_the_physics_quality_limit() {
+        let (building, _) = building(&[]);
+        // No room for its shards: it flies whole, as before.
+        let mut debris = BrickDebris::new();
+        debris.set_limit(3);
+        debris
+            .cues(&[hit(4, 1, [0.0, 0.3, 0.0], [0.0, 0.6, 0.0])], &building)
+            .unwrap();
+        assert_eq!(debris.len(), 1);
+        // Room for one cracked brick: the next one's shards replace it.
+        let mut debris = BrickDebris::new();
+        debris.set_limit(4);
+        let hits = [
+            hit(4, 1, [0.0, 0.3, 0.0], [0.0, 0.6, 0.0]),
+            hit(6, 2, [3.0, 0.3, 0.0], [3.0, 0.6, 0.0]),
+        ];
+        debris.cues(&hits, &building).unwrap();
+        assert_eq!(debris.len(), 4);
+        assert_eq!(debris.diagnostics.evicted, 4);
+        assert!(debris.bodies.keys().all(|(cue, _)| *cue == 6));
+        // Physics Quality Off: nothing at all.
+        let mut debris = BrickDebris::new();
+        debris.set_limit(0);
+        debris
+            .cues(&[hit(1, 1, [0.0, 0.3, 0.0], [0.0, 0.6, 0.0])], &building)
+            .unwrap();
+        assert!(debris.is_empty());
+    }
+
+    #[test]
+    fn a_shard_look_builds_its_own_piece_of_the_brick() {
+        let mesh = crate::brick_shards::tests::box_mesh("mesh/box", 2, 4, 3);
+        let meshes = BTreeMap::from([("definition/box".to_owned(), mesh.clone())]);
+        let materials = crate::materials::BrickMaterials::in_memory();
+        let palette = BrickPalette::new(&materials).unwrap();
+        let colors = [[0.9, 0.2, 0.1, 1.0]];
+        let whole = Look {
+            definition: "definition/box".into(),
+            color: 0,
+            color_effect: 0,
+            shape_effect: 0,
+            print: None,
+            shard: None,
+        };
+        let full = look_scene(&whole, &meshes, &palette, &materials, &colors)
+            .unwrap()
+            .unwrap();
+        let mut rng = Seeded::new(7);
+        let found = cracks(&mesh, Vec3::new(0.1, 0.0, 0.2), || rng.signed());
+        let pieces = shards(mesh.half_size(), &found);
+        assert_eq!(pieces.len(), 4);
+        for shard in &pieces {
+            let look = Look {
+                shard: Some(ShardLook {
+                    cue: 9,
+                    index: shard.index,
+                    cracks: found.clone(),
+                }),
+                ..whole.clone()
+            };
+            let piece = look_scene(&look, &meshes, &palette, &materials, &colors)
+                .unwrap()
+                .unwrap();
+            assert!(piece.images.is_empty(), "shards share the brick palette");
+            assert_eq!(piece.materials, full.materials);
+            let reach = piece
+                .vertices
+                .iter()
+                .map(|v| Vec3::from(v.position).length())
+                .fold(0.0, f32::max);
+            assert!(
+                reach < mesh.half_size().length(),
+                "a shard bigger than its brick"
+            );
+        }
+    }
+
     #[test]
     fn debris_expires_on_frame_time_even_when_slow_frames_drop_steps() {
         let (building, _) = building(&[]);
@@ -1880,7 +2481,199 @@ pub(crate) mod tests {
         assert_eq!(debris.len(), 2048);
         assert_eq!(debris.diagnostics.evicted, 452);
         // The newest blast's bricks are all there; the oldest made way.
-        assert!(debris.bodies.contains_key(&5999) && !debris.bodies.contains_key(&1));
+        assert!(debris.bodies.contains_key(&(5999, 0)) && !debris.bodies.contains_key(&(1, 0)));
+    }
+
+    #[test]
+    fn an_ordinary_blast_starts_moving_its_material_promptly() {
+        let (building, _) = building(&[]);
+        let mut debris = BrickDebris::new();
+        debris.set_limit(2048);
+        debris.cues(&blast(64, 1, 8.0), &building).unwrap();
+        let initial: BTreeMap<_, _> = debris
+            .bodies
+            .iter()
+            .map(|(key, body)| (*key, debris.world.bodies[body.handle].translation()))
+            .collect();
+        for _ in 0..6 {
+            debris.advance(1. / 60., &building).unwrap();
+        }
+        let moved = debris
+            .bodies
+            .iter()
+            .filter(|(key, body)| {
+                (debris.world.bodies[body.handle].translation() - initial[key]).length() > 0.05
+            })
+            .count();
+        eprintln!(
+            "blast members moving after 100ms: {moved}/{}",
+            initial.len()
+        );
+        assert!(
+            moved >= 56,
+            "blast material stayed frozen: {moved}/{} moved after 100ms",
+            initial.len()
+        );
+    }
+
+    #[test]
+    fn blast_response_scales_with_shared_surroundings_instead_of_freezing_material() {
+        let mut failures = Vec::new();
+        for (count, dense) in [(64, true), (512, false), (2048, false)] {
+            let mut nearby = Vec::new();
+            if dense {
+                for x in 0..8 {
+                    for y in 0..10 {
+                        for z in 2..8 {
+                            nearby.push((
+                                10000 + nearby.len() as u64,
+                                [x as f32, 0.3 + y as f32 * 0.6, z as f32],
+                            ));
+                        }
+                    }
+                }
+            }
+            let (building, _) = building(&nearby);
+            let mut debris = BrickDebris::new();
+            debris.set_limit(2048);
+            debris.cues(&blast(count, 1, 8.), &building).unwrap();
+            let initial: Vec<_> = debris
+                .bodies
+                .values()
+                .map(|body| (body.handle, debris.world.bodies[body.handle].translation()))
+                .collect();
+            let mut early = 0;
+            let mut response_ms = None;
+            let mut previous: Vec<_> = initial.iter().map(|(_, p)| *p).collect();
+            let mut path = 0.;
+            let mut max_paused = 0;
+            for frame in 1..=30 {
+                debris.advance(1. / 60., &building).unwrap();
+                for (i, (h, _)) in initial.iter().enumerate() {
+                    let at = debris.world.bodies[*h].translation();
+                    path += at.distance(previous[i]);
+                    previous[i] = at;
+                }
+                let paused = initial
+                    .iter()
+                    .filter(|(h, _)| !debris.world.bodies[*h].is_enabled())
+                    .count();
+                if frame >= 6 {
+                    max_paused = max_paused.max(paused);
+                }
+                let moving = initial
+                    .iter()
+                    .filter(|(h, p)| (debris.world.bodies[*h].translation() - *p).length() > 0.05)
+                    .count();
+                if response_ms.is_none() && moving * 10 >= initial.len() * 9 {
+                    response_ms = Some(frame * 1000 / 60);
+                }
+                if frame == 6 {
+                    early = moving;
+                }
+                if [6, 15, 30].contains(&frame) {
+                    eprintln!(
+                        "blast {count}, dense={dense}, {}ms: {moving} displaced, {paused} waiting for collision",
+                        frame * 1000 / 60
+                    );
+                }
+            }
+            eprintln!("blast {count}: 90% response {response_ms:?}ms");
+            eprintln!(
+                "blast {count}: mean path over500ms {:.3} units, peak paused after100ms {max_paused}",
+                path / count as f32
+            );
+            assert!(
+                path / count as f32 > 0.5,
+                "only a weak roll, not a blast throw"
+            );
+            assert!(
+                max_paused * 10 <= count as usize,
+                "physics kept stalling after starting"
+            );
+            if early * 10 < initial.len() * 9 {
+                failures.push((count, early));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "material frozen after100ms: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn stress_continuous_world_edits_with_best_quality_rubble() {
+        use std::time::{Duration, Instant};
+        for (iterations, dt) in [(4, 1. / 60.), (2, 1. / 60.), (4, 1. / 30.), (2, 1. / 30.)] {
+            let dt: f32 = dt;
+            let frames = (6. / dt).round() as usize;
+            let (mut building, mut world) = building(&[(100000, [4., 0.3, 4.])]);
+            let mut debris = BrickDebris::new();
+            debris.world.integration_parameters.num_solver_iterations = iterations;
+            debris.set_limit(2048);
+            debris.cues(&blast(2048, 1, 8.), &building).unwrap();
+            let mut totals = BTreeMap::<&str, Duration>::new();
+            let mut simulation_frames = Vec::with_capacity(frames);
+            let mut worst = Duration::ZERO;
+            let mut awake = 0;
+            for frame in 0..frames {
+                if frame % (0.1 / dt).round() as usize == 0 {
+                    world.bricks.get_mut(&100000).unwrap().color ^= 1;
+                    building
+                        .sync_world_changes(
+                            &world,
+                            Some(&crate::network::WorldChanges {
+                                bricks: [100000].into(),
+                                palette: false,
+                            }),
+                        )
+                        .unwrap();
+                }
+                let start = Instant::now();
+                debris.advance(dt, &building).unwrap();
+                let elapsed = start.elapsed();
+                worst = worst.max(elapsed);
+                let trace = crate::frame_trace::finish(elapsed, false);
+                for span in trace.spans {
+                    if span.name == "debris simulation" {
+                        simulation_frames.push(span.time);
+                    }
+                    *totals.entry(span.name).or_default() += span.time;
+                }
+                if frame >= frames * 2 / 3 {
+                    awake += debris.work().awake;
+                }
+                assert_eq!(
+                    debris.len(),
+                    2048,
+                    "no material may disappear to reduce cost"
+                );
+            }
+            eprintln!(
+                "continuous rubble: iterations={iterations}, dt={dt:.4}, worst={:.3}ms, average late awake={:.1}",
+                worst.as_secs_f64() * 1000.,
+                awake as f64 / (frames - frames * 2 / 3) as f64
+            );
+            for (phase, elapsed) in totals {
+                eprintln!(
+                    "{phase}: {:.3}ms/frame",
+                    elapsed.as_secs_f64() * 1000. / frames as f64
+                );
+            }
+            simulation_frames.sort_unstable();
+            eprintln!(
+                "simulation percentiles: p50={:.3}ms p95={:.3}ms p99={:.3}ms",
+                simulation_frames[simulation_frames.len() / 2].as_secs_f64() * 1000.,
+                simulation_frames[simulation_frames.len() * 95 / 100].as_secs_f64() * 1000.,
+                simulation_frames[simulation_frames.len() * 99 / 100].as_secs_f64() * 1000.,
+            );
+            for at in debris.positions() {
+                assert!(at.is_finite(), "unstable debris pose");
+                if at.x.abs() < 49. && at.z.abs() < 49. {
+                    assert!(at.y >= -0.05, "debris fell through the floor: {at}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1926,7 +2719,7 @@ pub(crate) mod tests {
             })
             .collect();
         debris.cues(&cues, &building).unwrap();
-        let rb = &debris.world.bodies[debris.bodies[&1].handle];
+        let rb = &debris.world.bodies[debris.bodies[&(1, 0)].handle];
         let speed = Vec3::from_array(rb.linvel().to_array()).length();
         // 4 force * 0.5 * falloff 0.75: one shove, not forty.
         assert!(speed < 2.0, "shoved {speed} units/s");
@@ -1949,6 +2742,7 @@ pub(crate) mod tests {
             color_effect: 0,
             shape_effect: 0,
             print: None,
+            shard: None,
         };
         let looks = [
             plain.clone(),
