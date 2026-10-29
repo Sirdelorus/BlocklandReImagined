@@ -713,16 +713,21 @@ impl AdminRuntime {
                         .connection_to_owner
                         .get(&target)
                         .context("That player is no longer connected")?;
+                    // `serverCmdKick`'s neighbour: say who was silenced, and
+                    // with the same line and sound when they are heard again.
+                    let name = session.peers.get(&owner).map(|p| p.name.clone());
                     if muted {
-                        session.mute_voice(owner);
-                        // `serverCmdKick`'s neighbour: say who was silenced.
-                        let name = session.peers.get(&owner).map(|p| p.name.clone());
+                        session.mute_voice(owner)?;
                         session.admin_announce(format!(
                             "\u{E003}{actor_name}\u{E002} muted \u{E003}{}'s voice",
                             name.unwrap_or_default()
                         ));
                     } else {
                         session.unmute_voice(owner);
+                        session.admin_announce(format!(
+                            "\u{E003}{actor_name}\u{E002} unmuted \u{E003}{}'s voice",
+                            name.unwrap_or_default()
+                        ));
                     }
                     changed = true;
                 }
@@ -845,7 +850,8 @@ impl Session {
         principal: Option<Principal>,
     ) -> Result<Role> {
         let now = self.wall_clock();
-        self.admin
+        let result = self
+            .admin
             .connect(owner, name, trusted_host, is_bot, principal, now)
             .map_err(|error| {
                 // Tell a banned player how long is left and why, as v20 did.
@@ -870,7 +876,11 @@ impl Session {
                     ),
                     None => error,
                 }
-            })
+            });
+        if result.is_ok() {
+            self.restore_voice_mute(owner, principal);
+        }
+        result
     }
 
     pub fn restore_admin_state(&mut self, bytes: &[u8]) -> Result<()> {

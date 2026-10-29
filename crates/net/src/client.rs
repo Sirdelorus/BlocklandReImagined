@@ -844,10 +844,11 @@ impl Client {
                 // the audio; a full inbox drops the frame.
                 if crate::voice::is_voice(&bytes) {
                     if let Some(heard) = crate::voice::decode_downstream(&bytes) {
-                        let _ = voice_inbox.try_send(heard);
+                        let _ = voice_inbox.try_send((std::time::Instant::now(), heard));
                     } else if let Some(activity) = crate::voice::decode_downstream_activity(&bytes)
                     {
-                        let _ = voice_activity_inbox.try_send(activity);
+                        let _ =
+                            voice_activity_inbox.try_send((std::time::Instant::now(), activity));
                     }
                     continue;
                 }

@@ -1596,6 +1596,32 @@ fn voice() -> Session {
     s
 }
 
+#[test]
+fn voice_moderation_follows_verified_identity_through_reconnect_and_rename() {
+    let mut session = voice();
+    let speaker = verified(&mut session, "First name", A_SPAWN, 4);
+    session.mute_voice(speaker).unwrap();
+    session.disconnect(speaker).unwrap();
+    assert!(
+        !session.voice_mute_set().contains(&speaker),
+        "disconnected owner IDs are forgotten"
+    );
+    let rejoined = verified(&mut session, "New name", A_SPAWN, 4);
+    assert!(
+        session.is_voice_muted(rejoined),
+        "reconnect cannot evade moderation"
+    );
+    let other = verified(&mut session, "First name", B_SPAWN, 5);
+    assert!(
+        !session.is_voice_muted(other),
+        "names do not confer identity"
+    );
+    session.unmute_voice(rejoined);
+    session.disconnect(rejoined).unwrap();
+    let heard_again = verified(&mut session, "Third name", A_SPAWN, 4);
+    assert!(!session.is_voice_muted(heard_again));
+}
+
 /// Requests (host): Admin(VoiceMute guest); Admin(VoiceUnmute guest).
 #[test]
 fn an_admin_mutes_a_players_voice_and_the_snapshot_says_so() {
@@ -1627,6 +1653,20 @@ fn an_admin_mutes_a_players_voice_and_the_snapshot_says_so() {
     let after = g.s.admin_state(host).unwrap();
     assert_eq!(after.voice_muted, BTreeSet::from([guest_conn.0]));
 
+    // Everyone but owner 0 hears who was silenced — with the admin sound.
+    for peer in [host, guest] {
+        assert!(
+            g.log.iter().any(|(to, n)| *to == peer && matches!(n, Notice::Chat(t) if t.contains("\u{e002} muted ") && t.contains("Guest's voice"))),
+            "the mute is announced to {peer}"
+        );
+        assert!(
+            g.log
+                .iter()
+                .any(|(to, n)| *to == peer && matches!(n, Notice::Sound(s) if s == "AdminSound")),
+            "with the admin sound for {peer}"
+        );
+    }
+
     let reply = g
         .cmd(host, admin(Action::VoiceUnmute { target: guest_conn }))
         .unwrap();
@@ -1635,6 +1675,14 @@ fn an_admin_mutes_a_players_voice_and_the_snapshot_says_so() {
     };
     assert!(!g.s.is_voice_muted(guest), "the mute is off again");
     assert!(reply.snapshot.voice_muted.is_empty());
+
+    // The unmute is announced the same way, with the same sound.
+    for peer in [host, guest] {
+        assert!(
+            g.log.iter().any(|(to, n)| *to == peer && matches!(n, Notice::Chat(t) if t.contains("unmuted") && t.contains("Guest's voice"))),
+            "the unmute is announced to {peer}"
+        );
+    }
 }
 
 /// Requests (host, no Add-On): Admin(VoiceMute guest); (guest, with the

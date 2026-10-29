@@ -10,7 +10,6 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, TryLockError, mpsc};
-use std::thread::JoinHandle;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
@@ -21,7 +20,15 @@ use crate::voice::{Activation, Downsampler, Encoder, Mixer, SAMPLE_RATE, Setting
 
 /// Finished frames waiting for the game thread; a stalled game drops the
 /// newest rather than growing.
-const OUTGOING_FRAMES: usize = 64;
+const OUTGOING_FRAMES: usize = 5;
+const MAX_CAPTURE_AGE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Capture-clock sequence advances through silence and dropped frames.
+pub struct CapturedFrame {
+    pub sequence: u16,
+    pub payload: crate::voice::EncodedFrame,
+    captured: std::time::Instant,
+}
 
 /// What the thread that owns the streams reports once they are open.
 struct Opened {
@@ -33,10 +40,9 @@ struct Opened {
 pub struct VoiceChat {
     shared: Arc<Shared>,
     mixer: Arc<Mutex<Mixer>>,
-    frames: mpsc::Receiver<Vec<u8>>,
+    frames: rtrb::Consumer<CapturedFrame>,
     opened: Opened,
     stop: mpsc::Sender<()>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl VoiceChat {
@@ -46,8 +52,9 @@ impl VoiceChat {
     /// missing is an error. Disabled voice activity opens no microphone at all.
     pub fn open(settings: Settings, input_device: Option<String>) -> Result<Self, AudioError> {
         let shared = Arc::new(Shared::new(settings));
+        shared.set_transmit_allowed(false);
         let mixer = Arc::new(Mutex::new(Mixer::new(shared.clone())));
-        let (frames_tx, frames) = mpsc::sync_channel(OUTGOING_FRAMES);
+        let (frames_tx, frames) = rtrb::RingBuffer::new(OUTGOING_FRAMES);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Opened, AudioError>>();
         let (stop, stop_rx) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -91,7 +98,6 @@ impl VoiceChat {
                 frames,
                 opened,
                 stop,
-                thread: Some(thread),
             }),
             Ok(Err(error)) => {
                 let _ = thread.join();
@@ -106,6 +112,9 @@ impl VoiceChat {
         }
     }
 
+    pub fn set_transmit_allowed(&self, allowed: bool) {
+        self.shared.set_transmit_allowed(allowed);
+    }
     pub fn apply_settings(&self, settings: Settings) {
         self.shared.apply(settings);
     }
@@ -145,6 +154,9 @@ impl VoiceChat {
     pub fn hear(&self, speaker: u64, position: Vec3, sequence: u16, payload: &[u8]) {
         lock(&self.mixer).hear(speaker, position, sequence, payload);
     }
+    pub fn forget(&self, speaker: u64) {
+        lock(&self.mixer).forget(speaker);
+    }
     /// Players heard in the last moment.
     pub fn speaking(&self) -> Vec<u64> {
         lock(&self.mixer).speaking(self.opened.output_rate.max(1))
@@ -155,17 +167,20 @@ impl VoiceChat {
         lock(&self.mixer).levels()
     }
     /// Move the frames the microphone finished into `out`, oldest first.
-    pub fn take_frames(&self, out: &mut Vec<Vec<u8>>) {
-        out.extend(self.frames.try_iter());
+    pub fn take_frames(&mut self, out: &mut Vec<CapturedFrame>) {
+        while let Ok(frame) = self.frames.pop() {
+            if frame.captured.elapsed() <= MAX_CAPTURE_AGE {
+                out.push(frame);
+            }
+        }
     }
 }
 
 impl Drop for VoiceChat {
     fn drop(&mut self) {
         let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // The worker owns the streams and releases them after this signal.
+        // A slow device driver must not stall the game during teardown.
     }
 }
 
@@ -361,20 +376,19 @@ where
 fn open_input(
     host: &cpal::Host,
     shared: &Arc<Shared>,
-    frames: mpsc::SyncSender<Vec<u8>>,
+    frames: rtrb::Producer<CapturedFrame>,
     wanted: Option<&str>,
 ) -> Result<cpal::Stream, AudioError> {
     let usable = |device: &cpal::Device| input_config(device).is_some();
-    let device = wanted
-        .and_then(|name| {
-            host.input_devices()
-                .ok()?
-                .find(|d| device_name(d).as_deref() == Some(name) && usable(d))
-        })
-        // A saved input can disappear or become unsupported between listing
-        // and opening. In that case fall back to the backend's usable default.
-        .or_else(|| host.default_input_device().filter(usable))
-        .ok_or(AudioError::NoDevice)?;
+    // A named input is explicit consent to that device. If it disappears,
+    // listen only and retry; never silently activate another microphone.
+    let device = match wanted {
+        Some(name) => host.input_devices().ok().and_then(|mut devices| {
+            devices.find(|d| device_name(d).as_deref() == Some(name) && usable(d))
+        }),
+        None => host.default_input_device().filter(usable),
+    }
+    .ok_or(AudioError::NoDevice)?;
     let supported = input_config(&device).ok_or(AudioError::NoDevice)?;
     let rate = supported.sample_rate();
     let mut config = supported.config();
@@ -399,7 +413,7 @@ fn build_input<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
-    frames: mpsc::SyncSender<Vec<u8>>,
+    mut frames: rtrb::Producer<CapturedFrame>,
     channels: usize,
     rate: u32,
 ) -> Result<cpal::Stream, AudioError>
@@ -409,24 +423,26 @@ where
 {
     let mut down = Downsampler::new(rate);
     let mut encoder = Encoder::new(shared.clone());
-    let mut voice: Vec<f32> = Vec::with_capacity(4096);
     let error_shared = shared.clone();
     device
         .build_input_stream::<T, _, _>(
             *config,
             move |data: &[T], _| {
-                voice.clear();
+                let mut send = |sequence, payload| {
+                    let _ = frames.push(CapturedFrame {
+                        sequence,
+                        payload,
+                        captured: std::time::Instant::now(),
+                    });
+                };
                 for frame in data.chunks(channels) {
                     let sum: f32 = frame.iter().map(|&s| f32::from_sample(s)).sum();
                     if let Some(sample) = down.push(sum / frame.len() as f32) {
-                        voice.push(sample);
+                        encoder.feed(std::slice::from_ref(&sample), &mut send);
                     }
                 }
-                // A full queue means the game thread stalled; the frame is
-                // lost, which is what a stalled game would have done anyway.
-                encoder.feed(&voice, &mut |frame| {
-                    let _ = frames.try_send(frame);
-                });
+                // A full ring drops speech while its capture clock advances;
+                // the real-time callback never waits or allocates a packet.
             },
             move |err| failed(&error_shared, "input", &err),
             None,

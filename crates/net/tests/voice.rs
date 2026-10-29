@@ -109,11 +109,13 @@ async fn voice_reaches_only_the_players_within_range() -> Result<()> {
     let near = connect(&server, "Near").await?;
     let far = connect(&server, "Far").await?;
     let (talk, near_link, far_link) = (speaker.voice_link(), near.voice_link(), far.voice_link());
+    let mut heard = Vec::new();
     for sequence in 0..5 {
         talk.send(sequence, &[sequence as u8 + 1; 163])?;
         tokio::time::sleep(Duration::from_millis(20)).await;
+        near_link.take_heard(&mut heard);
     }
-    let heard = hear(&near_link, 5, Duration::from_secs(3)).await;
+    heard.extend(hear(&near_link, 5 - heard.len(), Duration::from_secs(3)).await);
     assert_eq!(heard.len(), 5, "the player 10 units away hears every frame");
     for (i, frame) in heard.iter().enumerate() {
         assert_eq!(frame.speaker, speaker.owner);
@@ -161,6 +163,125 @@ async fn a_voice_flood_is_cut_to_the_allowance_and_nonsense_is_ignored() -> Resu
         heard.len() < 100,
         "{} of 400 frames passed a flood allowance",
         heard.len()
+    );
+    server.stop().await?;
+    Ok(())
+}
+
+/// Exercise the actual encrypted transport with all 32 clients transmitting,
+/// not only a 32-entry data structure. Drain every render interval as clients do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thirty_two_simultaneous_speakers_preserve_identity_and_game_commands() -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut config = common::options();
+    config.spawn_points = (0..32)
+        .map(|i| Vec3::new((i % 8) as f32 * 2.0, 0.05, (i / 8) as f32 * 2.0))
+        .collect();
+    let server = server::start_with_limit(voice_session(), config, 32)?;
+    let mut clients = Vec::new();
+    for i in 0..32 {
+        clients.push(connect(&server, &format!("Speaker{i}")).await?);
+    }
+    let links: Vec<_> = clients.iter().map(Client::voice_link).collect();
+    let owners: BTreeSet<_> = clients.iter().map(|client| client.owner).collect();
+    let pcm = std::array::from_fn(|i| {
+        ((i as f32 * 0.173).sin() * 9000.0 + (i as f32 * 0.669).sin() * 3000.0) as i16
+    });
+    let payload = bri_audio::voice::Codec::encode(&pcm);
+    assert!(bri_audio::voice::Codec::valid(&payload));
+    let mut heard = vec![BTreeMap::<u64, usize>::new(); 32];
+    let mut interval = tokio::time::interval(Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    for sequence in 0..60 {
+        interval.tick().await;
+        for link in &links {
+            link.send(sequence, &payload)?;
+        }
+        for (index, link) in links.iter().enumerate() {
+            let mut frames = Vec::new();
+            link.take_heard(&mut frames);
+            for frame in frames {
+                assert_ne!(frame.speaker, clients[index].owner, "no self echo");
+                assert!(owners.contains(&frame.speaker), "host-stamped identity");
+                assert_eq!(frame.payload, payload);
+                *heard[index].entry(frame.speaker).or_default() += 1;
+            }
+        }
+        if sequence == 30 {
+            // A reliable gameplay operation must still complete while voices
+            // saturate the 32-player fanout. Its ordinary reply is authoritative.
+            let reply = tokio::time::timeout(
+                Duration::from_secs(3),
+                clients[0].command(bri_sim::session::Command::Chat("Voice load control".into())),
+            )
+            .await??;
+            assert!(
+                matches!(reply, bri_sim::session::Reply::Accepted),
+                "{reply:?}"
+            );
+        }
+    }
+    // Observe delivery rather than assert fragile wall-clock performance.
+    for (index, heard) in heard.iter().enumerate() {
+        assert_eq!(
+            heard.len(),
+            31,
+            "listener {index} hears every remote speaker"
+        );
+        assert!(
+            heard.values().all(|count| *count >= 30),
+            "listener {index}: {heard:?}"
+        );
+    }
+    eprintln!(
+        "32-player voice: {} relayed packets observed; payload {} bytes; 60 frames each",
+        heard
+            .iter()
+            .flat_map(|sources| sources.values())
+            .sum::<usize>(),
+        payload.len()
+    );
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_recovers_over_loss_jitter_and_duplication_without_blocking_chat() -> Result<()> {
+    use bri_net::impair::{ImpairedLink, Impairment};
+    let server = server::start(voice_session(), options())?;
+    let speaker = connect(&server, "Speaker").await?;
+    let impaired = ImpairedLink::start(server.address, Impairment::BAD_WIFI, 42).await?;
+    let mut listener = Client::connect(
+        impaired.address,
+        &server.certificate,
+        "Listener".into(),
+        vec![],
+        None,
+    )
+    .await?;
+    let talk = speaker.voice_link();
+    let listen = listener.voice_link();
+    let mut interval = tokio::time::interval(Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heard = Vec::new();
+    for sequence in 0..100 {
+        interval.tick().await;
+        talk.send(sequence, &[5; 60])?;
+        listen.take_heard(&mut heard);
+    }
+    assert!(
+        heard.len() >= 50,
+        "received {} frames under simulated bad Wi-Fi",
+        heard.len()
+    );
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        listener.command(bri_sim::session::Command::Chat("Still playing".into())),
+    )
+    .await??;
+    assert!(
+        matches!(reply, bri_sim::session::Reply::Accepted),
+        "{reply:?}"
     );
     server.stop().await?;
     Ok(())

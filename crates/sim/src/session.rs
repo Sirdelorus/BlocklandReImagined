@@ -1188,6 +1188,7 @@ pub struct Session {
     admin_disconnect_messages: BTreeMap<OwnerId, String>,
     /// Players whose voice an admin has muted (the host relays none of it).
     voice_muted: BTreeSet<OwnerId>,
+    voice_muted_principals: BTreeSet<bri_admin::Principal>,
     /// v20 `$Server::LAN`: single-player and LAN hosts use the looser brick
     /// damage rules.
     lan_host: bool,
@@ -1353,6 +1354,7 @@ impl Session {
             admin_disconnects: VecDeque::new(),
             admin_disconnect_messages: BTreeMap::new(),
             voice_muted: BTreeSet::new(),
+            voice_muted_principals: BTreeSet::new(),
             lan_host: false,
             loading: None,
             time_scale: 1.0,
@@ -2079,6 +2081,7 @@ impl Session {
         }
     }
     pub fn disconnect(&mut self, owner: OwnerId) -> Result<()> {
+        self.voice_muted.remove(&owner);
         // Left while still loading: they had nothing in the world to undo.
         if self.arrivals.contains_key(&owner) {
             self.announce(owner, "has left the game.", "ClientDropSound");

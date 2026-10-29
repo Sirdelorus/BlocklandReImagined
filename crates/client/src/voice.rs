@@ -56,6 +56,8 @@ const REMOTE_ACTIVITY_TIMEOUT: Duration = Duration::from_millis(1_500);
 pub struct Config {
     pub settings: VoiceSettings,
     pub mode: VoiceMode,
+    pub master_volume: f32,
+    pub mute_in_background: bool,
     /// The microphone by name; None is the system's default.
     pub device: Option<String>,
 }
@@ -79,6 +81,8 @@ pub fn config_from(prefs: &BTreeMap<String, String>) -> Config {
         }
         .sanitized(),
         mode,
+        master_volume: bri_ui::screens::options::volume(&prefs, "$pref::Audio::masterVolume"),
+        mute_in_background: prefs.bool_or("$pref::Audio::MuteInBackground", false),
         device: voice_device(&prefs),
     }
 }
@@ -91,11 +95,19 @@ pub fn input_devices() -> Vec<String> {
 pub struct VoiceClient {
     config: Config,
     chat: Option<VoiceChat>,
+    /// Driver startup can block; poll completion without blocking a game frame.
+    opening: Option<(
+        Config,
+        std::thread::JoinHandle<Result<VoiceChat, bri_audio::AudioError>>,
+    )>,
     /// Push To Talk is held. Kept here so a chat opened (or reopened) while
     /// it is held starts with it.
     talking: bool,
     /// A session is on and voice chat is enabled: the HUD indicator shows.
     active: bool,
+    session_link: Option<usize>,
+    focused: bool,
+    server_blocked: bool,
     /// Options is open: the existing capture stream also feeds its input meter,
     /// even when the player is at the main menu and no network link exists.
     preview_active: bool,
@@ -105,7 +117,9 @@ pub struct VoiceClient {
     /// Whether the player was told the devices could not be opened, so a
     /// machine without a microphone is told once, not every ten seconds.
     told: bool,
-    outgoing: Vec<Vec<u8>>,
+    outgoing: Vec<bri_audio::CapturedFrame>,
+    sequence_base: u16,
+    server_muted: BTreeSet<OwnerId>,
     heard: Vec<Heard>,
     activity_in: Vec<VoiceActivity>,
     speaking: Vec<OwnerId>,
@@ -124,13 +138,19 @@ impl VoiceClient {
         Self {
             config: config_from(&settings.prefs),
             chat: None,
+            opening: None,
             talking: false,
             active: false,
+            session_link: None,
+            focused: true,
+            server_blocked: false,
             preview_active: false,
             sequence: 0,
             retry_at: None,
             told: false,
             outgoing: Vec::new(),
+            sequence_base: 0,
+            server_muted: BTreeSet::new(),
             heard: Vec::new(),
             activity_in: Vec::new(),
             speaking: Vec::new(),
@@ -151,7 +171,7 @@ impl VoiceClient {
                 != (self.config.settings.activation == Activation::Disabled);
         self.config = config;
         if let Some(chat) = &self.chat {
-            chat.apply_settings(self.config.settings);
+            chat.apply_settings(self.audio_settings());
         }
         if reopen || !self.config.settings.enabled {
             // Closing the devices is the only honest "off".
@@ -161,12 +181,37 @@ impl VoiceClient {
             self.told = false;
         }
     }
+    fn audio_settings(&self) -> VoiceSettings {
+        let mut settings = self.config.settings;
+        settings.volume *= if !self.focused && self.config.mute_in_background {
+            0.0
+        } else {
+            self.config.master_volume
+        };
+        settings
+    }
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+        if !focused {
+            self.set_talking(false);
+        }
+        if let Some(chat) = &self.chat {
+            chat.apply_settings(self.audio_settings());
+            chat.set_transmit_allowed(focused && self.active && !self.server_blocked);
+        }
+    }
+    pub fn set_master_volume(&mut self, volume: f32) {
+        self.config.master_volume = volume;
+        if let Some(chat) = &self.chat {
+            chat.apply_settings(self.audio_settings());
+        }
+    }
     /// The volume slider is being dragged: other players' voices at `volume`
     /// (0 to 1) until the preferences are saved again.
     pub fn set_volume(&mut self, volume: f32) {
         self.config.settings.volume = volume;
         if let Some(chat) = &self.chat {
-            chat.apply_settings(self.config.settings);
+            chat.apply_settings(self.audio_settings());
         }
     }
     /// The Push To Talk key went down or up.
@@ -195,6 +240,7 @@ impl VoiceClient {
             key_held: self.talking,
             active: self.chat.as_ref().is_some_and(VoiceChat::activity),
             microphone: self.chat.as_ref().is_some_and(VoiceChat::has_input),
+            server_muted: self.server_blocked,
         })
     }
     /// The indicator, when it differs from what the UI was last given.
@@ -240,7 +286,7 @@ impl VoiceClient {
             .remote_activity
             .keys()
             .copied()
-            .filter(|owner| !self.muted.contains(owner))
+            .filter(|owner| !self.muted.contains(owner) && !self.server_muted.contains(owner))
             .collect();
         if self.local_speaking() && !self.muted.contains(&local_owner) {
             owners.insert(local_owner);
@@ -254,7 +300,7 @@ impl VoiceClient {
             .chat
             .as_ref()
             .map_or_else(BTreeMap::new, |chat| chat.speaker_levels());
-        levels.retain(|owner, _| !self.muted.contains(owner));
+        levels.retain(|owner, _| !self.muted.contains(owner) && !self.server_muted.contains(owner));
         if self.local_speaking() && !self.muted.contains(&local_owner) {
             let level = self.chat.as_ref().map_or(0.0, VoiceChat::level);
             if level > 0.0 {
@@ -267,6 +313,23 @@ impl VoiceClient {
     /// not told.
     pub fn mute(&mut self, owner: OwnerId) {
         self.muted.insert(owner);
+        if let Some(chat) = &self.chat {
+            chat.forget(owner);
+        }
+    }
+    /// Apply host moderation immediately, including speech already buffered.
+    pub fn set_server_muted(&mut self, muted: &BTreeSet<OwnerId>, local_owner: OwnerId) {
+        for owner in muted.difference(&self.server_muted) {
+            self.remote_activity.remove(owner);
+            if let Some(chat) = &self.chat {
+                chat.forget(*owner);
+            }
+        }
+        self.server_muted.clone_from(muted);
+        self.server_blocked = muted.contains(&local_owner);
+        if self.server_blocked {
+            self.set_talking(false);
+        }
     }
     /// Take that local mute off again.
     pub fn unmute(&mut self, owner: OwnerId) {
@@ -281,6 +344,9 @@ impl VoiceClient {
         &self.muted
     }
     fn local_speaking(&self) -> bool {
+        if !self.active || !self.focused || self.server_blocked {
+            return false;
+        }
         let Some(chat) = &self.chat else { return false };
         if !chat.has_input() || !chat.activity() {
             return false;
@@ -297,9 +363,26 @@ impl VoiceClient {
     pub fn update(&mut self, transport: Option<&VoiceLink>, listener: Listener, now: Instant) {
         // Keep the raw session handle briefly so a settings change that turns
         // voice off can publish a final false state before we stop processing.
+        let session_link = transport.map(VoiceLink::id);
+        if self.session_link != session_link {
+            self.session_link = session_link;
+            self.chat = None;
+            self.opening = None;
+            self.muted.clear();
+            self.remote_activity.clear();
+            self.speaking.clear();
+            self.talking = false;
+            self.sent_activity = None;
+            self.activity_sent_at = None;
+            self.retry_at = None;
+        }
         let link = transport.filter(|_| self.config.settings.enabled);
         self.active = link.is_some();
-        let keep_capture = self.active || (self.preview_active && self.config.settings.enabled);
+        let keep_capture = self.active
+            || (self.preview_active
+                && self.focused
+                && self.config.settings.enabled
+                && self.config.mode != VoiceMode::Disabled);
         if !keep_capture {
             if self.sent_activity == Some(true)
                 && let Some(transport) = transport
@@ -307,8 +390,13 @@ impl VoiceClient {
                 let _ = transport.send_activity(false);
             }
             self.chat = None;
+            self.opening = None;
             self.speaking.clear();
             self.remote_activity.clear();
+            if transport.is_none() {
+                self.muted.clear();
+                self.server_muted.clear();
+            }
             self.active = false;
             self.retry_at = None;
             self.told = false;
@@ -318,35 +406,83 @@ impl VoiceClient {
             return;
         }
 
+        if self.chat.as_ref().is_some_and(|chat| {
+            (!chat.has_output() || (!chat.has_input() && self.config.mode != VoiceMode::Disabled))
+                && self.retry_at.is_some_and(|at| now >= at)
+        }) {
+            self.chat = None;
+        }
         if self.chat.as_ref().is_some_and(VoiceChat::is_broken) {
             bri_console::warn("Voice chat lost its audio device; reopening shortly");
             self.chat = None;
             self.retry_at = Some(now + RETRY / 2);
         }
-        if self.chat.is_none() && self.retry_at.is_none_or(|at| now >= at) {
-            match VoiceChat::open(self.config.settings, self.config.device.clone()) {
-                Ok(chat) => {
-                    chat.set_talking(self.talking);
-                    let disabled = self.config.mode == VoiceMode::Disabled;
-                    if !chat.has_input() && !disabled && !self.told {
-                        self.told = true;
-                        bri_console::warn(
-                            "Voice chat found no microphone; you can hear others but not talk",
-                        );
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|(_, task)| task.is_finished())
+        {
+            let (requested, task) = self.opening.take().expect("finished opener");
+            let result = task.join().unwrap_or_else(|_| {
+                Err(bri_audio::AudioError::Device(
+                    "voice device worker stopped".into(),
+                ))
+            });
+            let matches = requested.device == self.config.device
+                && (requested.mode == VoiceMode::Disabled)
+                    == (self.config.mode == VoiceMode::Disabled);
+            if matches {
+                match result {
+                    Ok(chat) => {
+                        chat.apply_settings(self.audio_settings());
+                        chat.set_talking(self.talking);
+                        let disabled = self.config.mode == VoiceMode::Disabled;
+                        if !chat.has_input() && !disabled && !self.told {
+                            self.told = true;
+                            bri_console::warn(
+                                "Voice chat found no microphone; listening only and retrying",
+                            );
+                        }
+                        if !chat.has_output() && !self.told {
+                            self.told = true;
+                            bri_console::warn(
+                                "Voice playback device unavailable; microphone can send, but listening is unavailable. Retrying.",
+                            );
+                        }
+                        self.sequence_base = self.sequence.wrapping_add(16);
+                        let partial = !chat.has_output() || (!chat.has_input() && !disabled);
+                        self.chat = Some(chat);
+                        self.retry_at = partial.then_some(now + RETRY);
                     }
-                    self.chat = Some(chat);
-                    self.retry_at = None;
+                    Err(error) => {
+                        if !self.told {
+                            self.told = true;
+                            bri_console::warn(format!("Voice chat is off: {error}"));
+                        }
+                        self.retry_at = Some(now + RETRY);
+                    }
                 }
+            }
+        }
+        if self.chat.is_none() && self.opening.is_none() && self.retry_at.is_none_or(|at| now >= at)
+        {
+            let settings = self.audio_settings();
+            let device = self.config.device.clone();
+            match std::thread::Builder::new()
+                .name("bri-voice-open".into())
+                .spawn(move || VoiceChat::open(settings, device))
+            {
+                Ok(task) => self.opening = Some((self.config.clone(), task)),
                 Err(error) => {
-                    if !self.told {
-                        self.told = true;
-                        bri_console::warn(format!("Voice chat is off: {error}"));
-                    }
+                    bri_console::warn(format!("Cannot start voice device worker: {error}"));
                     self.retry_at = Some(now + RETRY);
                 }
             }
         }
 
+        if let Some(chat) = &self.chat {
+            chat.set_transmit_allowed(self.active && self.focused && !self.server_blocked);
+        }
         // State packets are independent of the audio playback device and
         // carry no audio analysis beyond a boolean, periodically refreshed.
         if let Some(link) = link {
@@ -380,7 +516,7 @@ impl VoiceClient {
             self.activity_sent_at = None;
         }
 
-        let Some(chat) = &self.chat else {
+        let Some(chat) = &mut self.chat else {
             self.speaking.clear();
             return;
         };
@@ -388,18 +524,24 @@ impl VoiceClient {
         self.outgoing.clear();
         chat.take_frames(&mut self.outgoing);
         if let Some(link) = link {
-            for frame in self.outgoing.drain(..) {
+            for frame in self
+                .outgoing
+                .drain(..)
+                .filter(|_| self.focused && !self.server_blocked)
+            {
                 // The connection may be closing; a lost frame is a gap in
                 // someone's ears, nothing more.
-                let _ = link.send(self.sequence, &frame);
-                self.sequence = self.sequence.wrapping_add(1);
+                let sequence = self.sequence_base.wrapping_add(frame.sequence);
+                let _ = link.send(sequence, frame.payload.as_bytes());
+                self.sequence = sequence;
             }
             // Everyone else's voice, in.
             self.heard.clear();
             link.take_heard(&mut self.heard);
             for voice in self.heard.drain(..) {
                 // A locally muted player is not played back at all.
-                if self.muted.contains(&voice.speaker) {
+                if self.muted.contains(&voice.speaker) || self.server_muted.contains(&voice.speaker)
+                {
                     continue;
                 }
                 chat.hear(
@@ -499,6 +641,7 @@ mod tests {
                 key_held: false,
                 active: false,
                 microphone: false,
+                server_muted: false,
             })
         );
         voice.set_talking(true);

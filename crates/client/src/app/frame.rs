@@ -205,6 +205,16 @@ impl App {
         if let Some(building) = &mut self.build.building {
             building.set_passages(&self.motion.passages());
         }
+        if let Some(view) = self.net.attempt.as_ref().and_then(|a| a.view.as_ref()) {
+            self.voice.set_server_muted(&view.voice_muted, view.owner);
+            let muted = self
+                .voice
+                .muted()
+                .union(&view.voice_muted)
+                .copied()
+                .collect();
+            self.audio.sync_speech_mutes(muted, self.motion.presented());
+        }
         let span = crate::frame_trace::span("world presentation");
         let presented = self.advance_world_presentation(game_elapsed, third_person, &mut listener);
         drop(span);
@@ -217,9 +227,12 @@ impl App {
             .net
             .attempt
             .as_ref()
-            .filter(|a| a.entered)
+            .filter(|a| a.entered && a.view.as_ref().is_some_and(|view| view.voice_chat))
             .and_then(|a| a.worker.probes.get())
             .map(|probes| &probes.voice);
+        if let Some(view) = self.net.attempt.as_ref().and_then(|a| a.view.as_ref()) {
+            self.voice.set_server_muted(&view.voice_muted, view.owner);
+        }
         self.voice
             .set_preview_active(self.ui.core.voice_preview_active);
         self.voice
@@ -1031,7 +1044,8 @@ impl App {
             && let Some(building) = &self.build.building
         {
             let presented = self.motion.presented();
-            let voice_speakers = self.voice.speaking_owners(view.owner);
+            let mut voice_speakers = self.voice.speaking_owners(view.owner);
+            voice_speakers.extend(self.audio.speaking_owners());
             // Balls, projectiles, dropped items and package entities move at
             // the frame rate between the host's 20 Hz updates.
             let projectiles = &self.content.weapons.pack.projectiles;

@@ -1405,6 +1405,8 @@ impl App {
             water_eyes,
             fog_end.clamped(1., FAR_PLANE),
         )?;
+        let mut speaking = self.voice.speaking_owners(view.owner);
+        speaking.extend(self.audio.speaking_owners());
         self.ui.core.name_tags = name_tags(
             view,
             self.motion.presented(),
@@ -1421,7 +1423,7 @@ impl App {
             ),
             self.ui.scale(),
             controls.observer().is_none(),
-            &self.voice.speaking_owners(view.owner),
+            &speaking,
             &self.voice.speaking_levels(view.owner),
             &passages,
             |drop| self.world_items.drop_center(drop),

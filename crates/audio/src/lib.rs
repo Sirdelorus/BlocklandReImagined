@@ -33,4 +33,4 @@ pub use reverb::Room;
 pub use runtime::{AudioRuntime, AudioStats, OutputKind, RuntimeConfig};
 pub use spatial::{GainCurve, Hearing, Listener, Vec3, Window};
 #[cfg(feature = "cpal-output")]
-pub use voice_device::{VoiceChat, input_devices};
+pub use voice_device::{CapturedFrame, VoiceChat, input_devices};

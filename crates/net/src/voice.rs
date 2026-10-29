@@ -15,18 +15,21 @@
 //! from the client.
 use anyhow::{Result, ensure};
 use bri_world::OwnerId;
-use std::sync::{Arc, Mutex, mpsc};
+use std::{
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant},
+};
 
 /// The first byte of every voice datagram.
 pub const MARKER: u8 = 0xC1;
 /// How far a voice carries, in world units. Beyond it the host sends nothing.
 pub const RANGE: f32 = 48.0;
-/// Largest voice payload the host relays. An encoded frame is 163 bytes.
+/// Largest voice payload the host relays. Opus normally uses about 60 bytes.
 pub const MAX_PAYLOAD: usize = 256;
 /// Voice datagrams a client may send per second, sustained (50 a second is
 /// 20 ms frames), with room for a burst after a stall.
-pub const UPSTREAM_RATE: f64 = 75.0;
-pub const UPSTREAM_BURST: f64 = 25.0;
+pub const UPSTREAM_RATE: f64 = 60.0;
+pub const UPSTREAM_BURST: f64 = 5.0;
 const UPSTREAM: u8 = 1;
 const DOWNSTREAM: u8 = 2;
 const UPSTREAM_ACTIVITY: u8 = 3;
@@ -38,6 +41,12 @@ const DOWNSTREAM_HEADER: usize = 4 + 8 + 12;
 /// Received voice frames waiting for the game; the newest are dropped when
 /// it falls behind.
 const INBOX: usize = 256;
+
+/// Capture-clock sequence ordering, including wraparound.
+pub fn newer(old: u16, new: u16) -> bool {
+    let delta = new.wrapping_sub(old);
+    delta != 0 && delta < 0x8000
+}
 
 /// Whether `bytes` is a voice datagram.
 pub fn is_voice(bytes: &[u8]) -> bool {
@@ -183,14 +192,14 @@ pub fn audible(speaker: [f32; 3], listener: [f32; 3], range: f32) -> bool {
 }
 
 /// The sending end the transport task keeps for the datagram reader.
-pub(crate) type Inbox = mpsc::SyncSender<Heard>;
-pub(crate) type ActivityInbox = mpsc::SyncSender<VoiceActivity>;
+pub(crate) type Inbox = mpsc::SyncSender<(Instant, Heard)>;
+pub(crate) type ActivityInbox = mpsc::SyncSender<(Instant, VoiceActivity)>;
 
-pub(crate) fn inbox() -> (Inbox, mpsc::Receiver<Heard>) {
+pub(crate) fn inbox() -> (Inbox, mpsc::Receiver<(Instant, Heard)>) {
     mpsc::sync_channel(INBOX)
 }
 
-pub(crate) fn activity_inbox() -> (ActivityInbox, mpsc::Receiver<VoiceActivity>) {
+pub(crate) fn activity_inbox() -> (ActivityInbox, mpsc::Receiver<(Instant, VoiceActivity)>) {
     mpsc::sync_channel(64)
 }
 
@@ -200,15 +209,15 @@ pub(crate) fn activity_inbox() -> (ActivityInbox, mpsc::Receiver<VoiceActivity>)
 #[derive(Clone)]
 pub struct VoiceLink {
     connection: quinn::Connection,
-    heard: Arc<Mutex<mpsc::Receiver<Heard>>>,
-    activity: Arc<Mutex<mpsc::Receiver<VoiceActivity>>>,
+    heard: Arc<Mutex<mpsc::Receiver<(Instant, Heard)>>>,
+    activity: Arc<Mutex<mpsc::Receiver<(Instant, VoiceActivity)>>>,
 }
 
 impl VoiceLink {
     pub(crate) fn new(
         connection: quinn::Connection,
-        heard: mpsc::Receiver<Heard>,
-        activity: mpsc::Receiver<VoiceActivity>,
+        heard: mpsc::Receiver<(Instant, Heard)>,
+        activity: mpsc::Receiver<(Instant, VoiceActivity)>,
     ) -> Self {
         Self {
             connection,
@@ -216,11 +225,18 @@ impl VoiceLink {
             activity: Arc::new(Mutex::new(activity)),
         }
     }
+    /// Identifies a transport lifetime; local moderation/audio cannot leak
+    /// across sessions that happen to reuse an owner number.
+    pub fn id(&self) -> usize {
+        self.connection.stable_id()
+    }
     /// Send one voice frame. Voice is never retransmitted: a frame the
     /// network drops is a 20 ms gap.
     pub fn send(&self, sequence: u16, payload: &[u8]) -> Result<()> {
         let bytes = encode_upstream(sequence, payload)?;
-        self.connection.send_datagram(bytes.into())?;
+        if self.connection.datagram_send_buffer_space() >= bytes.len() + 8 * 1024 {
+            self.connection.send_datagram(bytes.into())?;
+        }
         Ok(())
     }
     /// Send the local speech-activity edge/keepalive. This is control state,
@@ -234,12 +250,22 @@ impl VoiceLink {
     /// Move the frames received so far into `out`, oldest first.
     pub fn take_heard(&self, out: &mut Vec<Heard>) {
         let receiver = self.heard.lock().unwrap_or_else(|e| e.into_inner());
-        out.extend(receiver.try_iter());
+        out.extend(
+            receiver
+                .try_iter()
+                .filter(|(at, _)| at.elapsed() <= Duration::from_millis(100))
+                .map(|(_, frame)| frame),
+        );
     }
     /// Move remote activity states received so far into `out`, oldest first.
     pub fn take_activity(&self, out: &mut Vec<VoiceActivity>) {
         let receiver = self.activity.lock().unwrap_or_else(|e| e.into_inner());
-        out.extend(receiver.try_iter());
+        out.extend(
+            receiver
+                .try_iter()
+                .filter(|(at, _)| at.elapsed() <= Duration::from_millis(1500))
+                .map(|(_, state)| state),
+        );
     }
 }
 

@@ -1,9 +1,8 @@
 //! Proximity voice chat: everything between the microphone, the wire and the
 //! speakers that needs no hardware.
 //!
-//! * [`Codec`]: IMA ADPCM at 16 kHz mono, 20 ms frames, 163 bytes each (about
-//!   65 kbit/s while someone talks). Every frame carries its own predictor
-//!   state, so a lost datagram costs 20 ms and nothing after it.
+//! * [`Codec`]: Opus wideband mono, 20 ms frames at 24 kbit/s with FEC.
+//!   Packet playout reorders, recovers isolated loss and bounds concealment.
 //! * [`Encoder`]: microphone samples in, gated and encoded frames out
 //!   (push to talk or voice activation).
 //! * [`Mixer`]: encoded frames from other players in, interleaved output
@@ -25,19 +24,19 @@ use crate::spatial::{Listener, Vec3, length, pan_gains, sub, torque_attenuation}
 pub const SAMPLE_RATE: u32 = 16_000;
 /// 20 ms of voice.
 pub const FRAME_SAMPLES: usize = 320;
-/// Bytes of one encoded frame: predictor (2), step index (1), 4 bits a sample.
-pub const FRAME_BYTES: usize = 3 + FRAME_SAMPLES / 2;
+/// Hard packet budget (Opus VBR normally uses about 60 bytes).
+pub const FRAME_BYTES: usize = 256;
 /// The distance at which a voice stops being heard, in world units, unless
 /// settings say less. The host sends nobody a voice beyond its own range.
 pub const DEFAULT_RANGE: f32 = 48.0;
 /// Inside this distance a voice is at full volume.
 const FULL_VOLUME_DISTANCE: f32 = 3.0;
 /// Most speakers mixed at once; the rest are not heard.
-pub const MAX_SPEAKERS: usize = 16;
+pub const MAX_SPEAKERS: usize = 32;
 /// Frames held before a speaker starts to play (the jitter buffer).
-const PREBUFFER_FRAMES: usize = 3;
+const PREBUFFER_FRAMES: usize = 2;
 /// Most frames held for one speaker; older audio is dropped to stay current.
-const MAX_BUFFERED_FRAMES: usize = 10;
+const MAX_BUFFERED_FRAMES: usize = 5;
 /// Output samples of silence after which an idle speaker is forgotten.
 const FORGET_AFTER_SECONDS: f32 = 4.0;
 /// A speaker counts as speaking this long after their last audio.
@@ -119,6 +118,7 @@ pub struct Shared {
     volume: AtomicU32,
     range: AtomicU32,
     transmitting: AtomicBool,
+    transmit_allowed: AtomicBool,
     activity: AtomicBool,
     level: AtomicU32,
     pub(crate) broken: AtomicBool,
@@ -135,6 +135,7 @@ impl Shared {
     pub fn new(settings: Settings) -> Self {
         let shared = Self::default();
         shared.apply(settings);
+        shared.transmit_allowed.store(true, Ordering::Relaxed);
         shared
     }
     pub fn apply(&self, settings: Settings) {
@@ -148,6 +149,13 @@ impl Shared {
         store(&self.mic_gain, s.mic_gain);
         store(&self.volume, s.volume);
         store(&self.range, s.range);
+    }
+    /// Session/focus/moderation gate, independent of the local input meter.
+    pub fn set_transmit_allowed(&self, allowed: bool) {
+        self.transmit_allowed.store(allowed, Ordering::Relaxed);
+        if !allowed {
+            self.transmitting.store(false, Ordering::Relaxed);
+        }
     }
     /// The push-to-talk control went down or up.
     pub fn set_talking(&self, talking: bool) {
@@ -176,101 +184,72 @@ impl Shared {
     }
 }
 
-const STEP: [i32; 89] = [
-    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
-    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
-    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
-    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
-    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
-];
-const INDEX: [i32; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
+mod jitter;
 
-/// The IMA ADPCM predictor.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct State {
-    predictor: i32,
-    index: i32,
+/// Fixed-size packet storage keeps capture and playout free of per-frame
+/// packet allocation. Byte zero marks the start of a new talk spurt.
+#[derive(Clone, Copy)]
+pub struct EncodedFrame {
+    bytes: [u8; FRAME_BYTES],
+    len: usize,
 }
-
-impl State {
-    /// Move the predictor by a code's difference; the encoder and decoder
-    /// both do exactly this, so they stay in step.
-    fn advance(&mut self, code: u8) -> i32 {
-        let step = STEP[self.index as usize];
-        let mut diff = step >> 3;
-        if code & 4 != 0 {
-            diff += step;
-        }
-        if code & 2 != 0 {
-            diff += step >> 1;
-        }
-        if code & 1 != 0 {
-            diff += step >> 2;
-        }
-        if code & 8 != 0 {
-            diff = -diff;
-        }
-        self.predictor = (self.predictor + diff).clamp(-32768, 32767);
-        self.index = (self.index + INDEX[usize::from(code & 7)]).clamp(0, 88);
-        self.predictor
-    }
-    fn encode(&mut self, sample: i16) -> u8 {
-        let step = STEP[self.index as usize];
-        let mut diff = i32::from(sample) - self.predictor;
-        let mut code = 0u8;
-        if diff < 0 {
-            code = 8;
-            diff = -diff;
-        }
-        if diff >= step {
-            code |= 4;
-            diff -= step;
-        }
-        if diff >= step >> 1 {
-            code |= 2;
-            diff -= step >> 1;
-        }
-        if diff >= step >> 2 {
-            code |= 1;
-        }
-        self.advance(code);
-        code
-    }
-}
-
-/// Encoding and decoding of one voice frame.
-pub struct Codec;
-
-impl Codec {
-    fn encode_with(state: &mut State, pcm: &[i16; FRAME_SAMPLES]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FRAME_BYTES);
-        out.extend_from_slice(&(state.predictor as i16).to_le_bytes());
-        out.push(state.index as u8);
-        for pair in pcm.as_chunks::<2>().0 {
-            let low = state.encode(pair[0]);
-            let high = state.encode(pair[1]);
-            out.push(low | high << 4);
-        }
-        out
-    }
-    /// One frame of 16-bit samples as bytes, starting from silence.
-    pub fn encode(pcm: &[i16; FRAME_SAMPLES]) -> Vec<u8> {
-        Self::encode_with(&mut State::default(), pcm)
-    }
-    /// The samples of a frame, or None when `bytes` is not exactly one.
-    pub fn decode(bytes: &[u8]) -> Option<[f32; FRAME_SAMPLES]> {
-        if bytes.len() != FRAME_BYTES || bytes[2] > 88 {
+impl EncodedFrame {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > FRAME_BYTES {
             return None;
         }
-        let mut state = State {
-            predictor: i32::from(i16::from_le_bytes([bytes[0], bytes[1]])),
-            index: i32::from(bytes[2]),
+        let mut frame = Self {
+            bytes: [0; FRAME_BYTES],
+            len: bytes.len(),
         };
-        let mut out = [0.0; FRAME_SAMPLES];
-        for (i, byte) in bytes[3..].iter().enumerate() {
-            out[2 * i] = state.advance(byte & 15) as f32 / 32768.0;
-            out[2 * i + 1] = state.advance(byte >> 4) as f32 / 32768.0;
+        frame.bytes[..bytes.len()].copy_from_slice(bytes);
+        Some(frame)
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Opus VoIP, wideband mono at 24 kbit/s with in-band FEC. The network
+/// envelopes are versioned by bri-net; every packet is exactly 20 ms.
+pub struct Codec;
+impl Codec {
+    fn encoder() -> Option<opus::Encoder> {
+        let mut encoder =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).ok()?;
+        encoder.set_bitrate(opus::Bitrate::Bits(24_000)).ok()?;
+        encoder.set_complexity(5).ok()?;
+        encoder.set_inband_fec(true).ok()?;
+        encoder.set_packet_loss_perc(10).ok()?;
+        Some(encoder)
+    }
+    pub fn valid(bytes: &[u8]) -> bool {
+        bytes.len() >= 2
+            && bytes.len() <= FRAME_BYTES
+            && bytes[0] <= 1
+            && opus::packet::get_nb_samples(&bytes[1..], SAMPLE_RATE).ok() == Some(FRAME_SAMPLES)
+            && opus::packet::get_nb_channels(&bytes[1..]).ok() == Some(opus::Channels::Mono)
+    }
+    /// Fixture helper. Live capture keeps one encoder across frames.
+    pub fn encode(pcm: &[i16; FRAME_SAMPLES]) -> Vec<u8> {
+        Self::encoder()
+            .and_then(|mut encoder| encoder.encode_vec(pcm, FRAME_BYTES - 1).ok())
+            .map(|packet| {
+                let mut framed = vec![1];
+                framed.extend(packet);
+                framed
+            })
+            .unwrap_or_default()
+    }
+    pub fn decode(bytes: &[u8]) -> Option<[f32; FRAME_SAMPLES]> {
+        if !Self::valid(bytes) {
+            return None;
         }
+        let mut out = [0.0; FRAME_SAMPLES];
+        opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
+            .ok()?
+            .decode_float(&bytes[1..], &mut out, false)
+            .ok()?;
         Some(out)
     }
 }
@@ -323,11 +302,12 @@ impl Downsampler {
 pub struct Encoder {
     shared: std::sync::Arc<Shared>,
     pending: Vec<f32>,
-    state: State,
+    codec: Option<opus::Encoder>,
     sending: bool,
     hang: u32,
     /// Frames left in which the microphone still counts as active.
     active_hang: u32,
+    sequence: u16,
 }
 
 /// Frames the activity flag stays up after the voice drops (200 ms).
@@ -344,15 +324,16 @@ impl Encoder {
         Self {
             shared,
             pending: Vec::with_capacity(FRAME_SAMPLES * 2),
-            state: State::default(),
+            codec: Codec::encoder(),
             sending: false,
             hang: 0,
             active_hang: 0,
+            sequence: 0,
         }
     }
     /// Take microphone samples at [`SAMPLE_RATE`]; `send` gets each finished
     /// frame that should go out.
-    pub fn feed(&mut self, samples: &[f32], send: &mut impl FnMut(Vec<u8>)) {
+    pub fn feed(&mut self, samples: &[f32], send: &mut impl FnMut(u16, EncodedFrame)) {
         for &sample in samples {
             self.pending
                 .push(if sample.is_finite() { sample } else { 0.0 });
@@ -362,7 +343,7 @@ impl Encoder {
             }
         }
     }
-    fn frame(&mut self, send: &mut impl FnMut(Vec<u8>)) {
+    fn frame(&mut self, send: &mut impl FnMut(u16, EncodedFrame)) {
         let gain = load(&self.shared.mic_gain);
         let mut pcm = [0i16; FRAME_SAMPLES];
         let mut energy = 0.0f32;
@@ -390,8 +371,13 @@ impl Encoder {
         } else {
             self.shared.talking.load(Ordering::Relaxed)
         };
-        let enabled = self.shared.enabled() && !self.shared.disabled.load(Ordering::Relaxed);
-        if open {
+        let enabled = self.shared.enabled()
+            && !self.shared.disabled.load(Ordering::Relaxed)
+            && self.shared.transmit_allowed.load(Ordering::Relaxed);
+        if !enabled {
+            self.hang = 0;
+        }
+        if open && enabled {
             self.hang = if voice { VOICE_HANG } else { PTT_HANG };
         }
         let sending = enabled && (open || self.hang > 0);
@@ -399,15 +385,28 @@ impl Encoder {
             self.hang -= 1;
         }
         if sending {
-            if !self.sending {
-                // A new burst starts from the voice, not from the last one.
-                self.state = State {
-                    predictor: i32::from(pcm[0]),
-                    index: 0,
+            if let Some(codec) = &mut self.codec {
+                let mut frame = EncodedFrame {
+                    bytes: [0; FRAME_BYTES],
+                    len: 0,
                 };
+                frame.bytes[0] = u8::from(!self.sending);
+                if !self.sending && codec.reset_state().is_err() {
+                    self.shared.broken.store(true, Ordering::Relaxed);
+                    return;
+                }
+                match codec.encode(&pcm, &mut frame.bytes[1..]) {
+                    Ok(len) => {
+                        frame.len = len + 1;
+                        send(self.sequence, frame);
+                    }
+                    Err(_) => self.shared.broken.store(true, Ordering::Relaxed),
+                }
+            } else {
+                self.shared.broken.store(true, Ordering::Relaxed);
             }
-            send(Codec::encode_with(&mut self.state, &pcm));
         }
+        self.sequence = self.sequence.wrapping_add(1);
         self.sending = sending;
         self.shared.transmitting.store(sending, Ordering::Relaxed);
     }
@@ -423,7 +422,8 @@ struct Speaker {
     position: Vec3,
     buffer: VecDeque<f32>,
     playing: bool,
-    last_sequence: Option<u16>,
+    jitter: jitter::Jitter,
+    waiting: f32,
     /// The sample the output is interpolating from, and how far toward the
     /// next one it is.
     current: f32,
@@ -443,9 +443,10 @@ impl Speaker {
     fn new(position: Vec3) -> Self {
         Self {
             position,
-            buffer: VecDeque::new(),
+            buffer: VecDeque::with_capacity(FRAME_SAMPLES),
             playing: false,
-            last_sequence: None,
+            jitter: jitter::Jitter::new(),
+            waiting: 0.0,
             current: 0.0,
             phase: 0.0,
             tail: 0.0,
@@ -455,7 +456,19 @@ impl Speaker {
         }
     }
     fn next(&mut self, step: f32) -> f32 {
+        if !self.playing && self.jitter.len() > 0 {
+            self.waiting += step;
+            if self.jitter.len() >= PREBUFFER_FRAMES || self.waiting >= FRAME_SAMPLES as f32 * 2.0 {
+                self.playing = true;
+                self.waiting = 0.0;
+            }
+        }
         if self.playing {
+            if self.buffer.is_empty()
+                && let Some(frame) = self.jitter.pop()
+            {
+                self.buffer.extend(frame);
+            }
             let Some(&next) = self.buffer.front() else {
                 self.playing = false;
                 self.tail = self.current;
@@ -496,6 +509,7 @@ pub struct Mixer {
     pub refused: u64,
     /// Frames that were not a valid voice frame.
     pub malformed: u64,
+    limiter_gain: f32,
 }
 
 impl Mixer {
@@ -506,6 +520,7 @@ impl Mixer {
             shared,
             refused: 0,
             malformed: 0,
+            limiter_gain: 1.0,
         }
     }
     pub fn set_listener(&mut self, listener: Listener) {
@@ -518,7 +533,7 @@ impl Mixer {
         if !self.shared.enabled() || !position.iter().all(|v| v.is_finite()) {
             return;
         }
-        let Some(frame) = Codec::decode(payload) else {
+        if !Codec::valid(payload) {
             self.malformed += 1;
             return;
         };
@@ -531,34 +546,16 @@ impl Mixer {
             .entry(speaker)
             .or_insert_with(|| Speaker::new(position));
         entry.position = position;
-        if let Some(last) = entry.last_sequence
-            && !newer(last, sequence)
-        {
-            return;
-        }
-        // A gap longer than the buffer starts a new burst.
-        if let Some(last) = entry.last_sequence
-            && sequence.wrapping_sub(last) > MAX_BUFFERED_FRAMES as u16
-        {
-            entry.buffer.clear();
-            entry.playing = false;
-        }
-        entry.last_sequence = Some(sequence);
-        entry.buffer.extend(frame);
-        let cap = MAX_BUFFERED_FRAMES * FRAME_SAMPLES;
-        if entry.buffer.len() > cap {
-            let excess = entry.buffer.len() - cap;
-            entry.buffer.drain(..excess);
-        }
-        if !entry.playing && entry.buffer.len() >= PREBUFFER_FRAMES * FRAME_SAMPLES {
-            entry.playing = true;
-        }
-        entry.idle_samples = 0;
+        entry.jitter.push(sequence, payload);
     }
     /// The gain a voice `distance` away is heard at.
     pub fn gain_at(distance: f32, range: f32) -> f32 {
         let linear = torque_attenuation(distance, FULL_VOLUME_DISTANCE, range);
         linear * linear
+    }
+    /// Purge buffered speech immediately when an actor is muted or leaves.
+    pub fn forget(&mut self, speaker: u64) {
+        self.speakers.remove(&speaker);
     }
     /// Players heard in the last moment.
     pub fn speaking(&self, sample_rate: u32) -> Vec<u64> {
@@ -627,8 +624,13 @@ impl Mixer {
         }
         self.speakers
             .retain(|_, s| s.playing || s.idle_samples < forget);
+        // A linked fast-attack limiter preserves relative speaker levels
+        // without the hard-clipping distortion of crowded conversations.
+        let peak = out.iter().fold(1.0_f32, |peak, v| peak.max(v.abs()));
+        self.limiter_gain =
+            (self.limiter_gain + frames as f32 / sample_rate as f32 * 2.0).min(1.0 / peak);
         for v in out.iter_mut() {
-            *v = v.clamped(-1.0, 1.0);
+            *v *= self.limiter_gain;
         }
     }
 }
@@ -656,23 +658,25 @@ mod tests {
     fn a_frame_survives_the_codec() {
         let samples = tone(1, 0.5);
         let bytes = Codec::encode(&pcm(&samples));
-        assert_eq!(bytes.len(), FRAME_BYTES);
+        assert!(!bytes.is_empty() && bytes.len() <= FRAME_BYTES);
         let decoded = Codec::decode(&bytes).unwrap();
-        // The predictor starts at silence, so judge the settled second half.
-        let error: f32 = (FRAME_SAMPLES / 2..FRAME_SAMPLES)
-            .map(|i| (decoded[i] - samples[i]).abs())
-            .fold(0.0, f32::max);
-        assert!(error < 0.05, "worst sample error {error}");
+        assert!(decoded.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+        assert!(decoded.iter().map(|s| s * s).sum::<f32>() > 0.1);
     }
 
     #[test]
     fn malformed_frames_are_refused() {
         assert!(Codec::decode(&[]).is_none());
-        assert!(Codec::decode(&[0; FRAME_BYTES - 1]).is_none());
-        let mut bad = vec![0; FRAME_BYTES];
-        bad[2] = 200;
-        assert!(Codec::decode(&bad).is_none());
-        assert!(Codec::decode(&[0; FRAME_BYTES]).is_some());
+        assert!(Codec::decode(&[0; FRAME_BYTES + 1]).is_none());
+        assert!(Codec::decode(&[0xff]).is_none());
+        // A valid Opus packet with the wrong duration cannot consume extra CPU.
+        let mut encoder = Codec::encoder().unwrap();
+        let short = encoder
+            .encode_vec(&[0; FRAME_SAMPLES / 2], FRAME_BYTES)
+            .unwrap();
+        let mut framed = vec![1];
+        framed.extend(short);
+        assert!(!Codec::valid(&framed));
     }
 
     #[test]
@@ -700,7 +704,7 @@ mod tests {
 
     fn feed(encoder: &mut Encoder, samples: &[f32]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
-        encoder.feed(samples, &mut |f| frames.push(f));
+        encoder.feed(samples, &mut |_, f| frames.push(f.as_bytes().to_vec()));
         frames
     }
 
@@ -772,6 +776,64 @@ mod tests {
         shared.set_talking(true);
         let mut encoder = Encoder::new(shared);
         assert!(feed(&mut encoder, &tone(5, 0.5)).is_empty());
+    }
+
+    #[test]
+    fn each_talk_spurt_marks_and_resets_its_codec_state() {
+        let shared = settings(Activation::PushToTalk);
+        let mut encoder = Encoder::new(shared.clone());
+        shared.set_talking(true);
+        let first = feed(&mut encoder, &tone(3, 0.5));
+        assert_eq!(first[0][0], 1);
+        assert_eq!(first[1][0], 0);
+        shared.set_talking(false);
+        feed(&mut encoder, &vec![0.0; FRAME_SAMPLES * 20]);
+        shared.set_talking(true);
+        let next = feed(&mut encoder, &tone(1, 0.5));
+        assert_eq!(
+            next[0], first[0],
+            "same first frame after a fresh codec reset"
+        );
+    }
+
+    #[test]
+    fn preview_focus_and_server_gates_never_transmit_or_leak_a_tail() {
+        let shared = settings(Activation::Voice);
+        let mut encoder = Encoder::new(shared.clone());
+        shared.set_transmit_allowed(false);
+        assert!(feed(&mut encoder, &tone(10, 0.5)).is_empty());
+        assert!(shared.activity(), "local meter still works");
+        shared.set_transmit_allowed(true);
+        assert_eq!(feed(&mut encoder, &tone(4, 0.5)).len(), 4);
+        shared.set_transmit_allowed(false);
+        assert!(feed(&mut encoder, &tone(5, 0.5)).is_empty());
+        shared.set_transmit_allowed(true);
+        assert!(
+            feed(&mut encoder, &vec![0.0; FRAME_SAMPLES * 2]).is_empty(),
+            "no stale hangover after a gate closes"
+        );
+    }
+
+    #[test]
+    fn all_thirty_one_remote_speakers_mix_and_mute_purges_buffered_audio() {
+        let mut mixer = Mixer::new(Arc::new(Shared::new(Settings::default())));
+        for owner in 1..32 {
+            speak(&mut mixer, owner, [0.0, 0.0, -2.0], 4, 0);
+        }
+        let mut out = vec![0.0; 960 * 2];
+        mixer.render(&mut out, 2, 48_000);
+        assert_eq!(mixer.speaking(48_000).len(), 31);
+        assert_eq!(mixer.refused, 0);
+        assert!(out.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        assert!(out.iter().any(|v| v.abs() > 0.1));
+        for owner in 1..32 {
+            mixer.forget(owner);
+        }
+        mixer.render(&mut out, 2, 48_000);
+        assert!(
+            out.iter().all(|v| *v == 0.0),
+            "mute clears audio and its fading tail immediately"
+        );
     }
 
     #[test]
@@ -862,9 +924,9 @@ mod tests {
         let shared = Arc::new(Shared::new(Settings::default()));
         let mut mixer = Mixer::new(shared);
         speak(&mut mixer, 1, [1.0, 0.0, 0.0], 4, 10);
-        let held = mixer.speakers[&1].buffer.len();
+        let held = mixer.speakers[&1].jitter.len();
         speak(&mut mixer, 1, [1.0, 0.0, 0.0], 4, 10);
-        assert_eq!(mixer.speakers[&1].buffer.len(), held);
+        assert_eq!(mixer.speakers[&1].jitter.len(), held);
     }
 
     #[test]
@@ -872,13 +934,13 @@ mod tests {
         let shared = Arc::new(Shared::new(Settings::default()));
         let mut mixer = Mixer::new(shared);
         speak(&mut mixer, 1, [1.0, 0.0, 0.0], 40, 0);
-        assert!(mixer.speakers[&1].buffer.len() <= MAX_BUFFERED_FRAMES * FRAME_SAMPLES);
+        assert!(mixer.speakers[&1].jitter.len() <= MAX_BUFFERED_FRAMES);
         for who in 0..(MAX_SPEAKERS as u64 + 4) {
             speak(&mut mixer, 100 + who, [1.0, 0.0, 0.0], 1, 0);
         }
         assert_eq!(mixer.speakers.len(), MAX_SPEAKERS);
         assert!(mixer.refused > 0);
-        mixer.hear(1, [0.0; 3], 99, &[1, 2, 3]);
+        mixer.hear(1, [0.0; 3], 99, &[0xff]);
         assert_eq!(mixer.malformed, 1);
     }
 

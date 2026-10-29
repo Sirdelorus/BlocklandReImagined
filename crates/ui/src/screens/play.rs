@@ -499,6 +499,18 @@ fn clip_slices([x0, y0, x1, y1]: [f32; 4], round: bool) -> Vec<Rect> {
 /// Pixel rows of a round clip: finer is a smoother circle and more draws.
 const ROUND_CLIP_ROW: i32 = 2;
 
+fn paint_panel_height(core: &Core) -> i32 {
+    let rows = core
+        .hud
+        .paint_rows
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(9)
+        .max(9) as i32;
+    rows * 17 + 1 + 18
+}
+
 fn hud(core: &Core) -> View {
     let (w, h) = core.logical;
     let m = &core.hud;
@@ -643,7 +655,7 @@ fn hud(core: &Core) -> View {
         }
         let px = -m.paint_slide.offset;
         let rows = m.paint_rows.iter().copied().max().unwrap_or(9).max(9) as i32;
-        let py = h - (rows * 17 + 1) - 18;
+        let py = h - paint_panel_height(core);
         let pw = m.paint_box_width();
         art(
             &mut v,
@@ -949,7 +961,16 @@ impl Screen for Play {
         hud(core).draw(pack, dl);
         package_panels(pack, dl, core);
         captions(pack, dl, core);
-        voice_indicator(dl, core.logical, core.voice);
+        // The palette reaches the lower left corner. Keep the microphone
+        // above its actual footprint rather than covering a paint swatch.
+        let lift = if (core.hud.mode == ScrollMode::Paint || !core.hud.prefs.hide_paint_box)
+            && !core.hud.paint.is_empty()
+        {
+            paint_panel_height(core) + 18 // palette title bar
+        } else {
+            0
+        };
+        voice_indicator(dl, (core.logical.0, core.logical.1 - lift), core.voice);
     }
 }
 
@@ -972,7 +993,8 @@ const VOICE_MARGIN: f32 = 12.0;
 pub fn voice_look(v: crate::api::VoiceIndicator) -> (crate::geom::Rgba, u8) {
     use crate::api::VoiceMode;
 
-    let open = v.microphone
+    let open = !v.server_muted
+        && v.microphone
         && match v.mode {
             VoiceMode::PushToTalk => v.key_held,
             VoiceMode::VoiceActivity => true,
@@ -1053,6 +1075,7 @@ mod voice_indicator_tests {
             key_held,
             active,
             microphone,
+            server_muted: false,
         }
     }
 

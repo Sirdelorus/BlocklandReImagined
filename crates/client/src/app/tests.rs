@@ -579,6 +579,48 @@ fn fov_is_horizontal_like_torque() {
     assert!((across.to_degrees() - 90.0).abs() < 1e-3, "{across}");
     assert!(fov_y.to_degrees() < 60.0);
 }
+
+#[test]
+fn third_person_camera_keeps_the_pivot_centered_at_the_downward_limit() {
+    use glam::Vec3;
+    use std::f32::consts::FRAC_PI_2;
+    let controls = super::Controls::default();
+    let (_, pivot, tilt) = super::pivot_camera(
+        2.65,
+        1.0,
+        super::PLAYER_CAMERA,
+        Vec3::new(3.0, 1.0, -2.0),
+        1.0,
+    );
+    for yaw in [0.0, 1.0, -2.5] {
+        for input_pitch in [
+            -FRAC_PI_2,
+            -FRAC_PI_2 + tilt - 0.001,
+            -FRAC_PI_2 + tilt + 0.001,
+            -1.2,
+            0.0,
+            FRAC_PI_2,
+        ] {
+            for roll in [0.0, 0.3] {
+                let look = crate::portal_view::leaned((yaw, input_pitch, roll), tilt);
+                let (forward, _, _) = super::rolled_view_basis(look.0, look.1, look.2);
+                // Full chase distance and collision-shortened booms must keep
+                // looking at the same anchor, including through vertical.
+                for distance in [8.0, 2.0, 0.5] {
+                    let eye = pivot - forward * distance;
+                    let (eye, yaw, pitch, roll) = super::finish_camera(&controls, eye, look, 0.0);
+                    let frame = crate::controls::view_frame(eye, yaw, pitch, roll).unwrap();
+                    let anchor = frame.inverse().transform_point3(pivot);
+                    assert!(
+                        anchor.x.abs() < 1e-4 && anchor.y.abs() < 1e-4,
+                        "pivot drift: input {input_pitch}, distance {distance}, anchor {anchor}"
+                    );
+                    assert!((anchor.z + distance).abs() < 1e-4);
+                }
+            }
+        }
+    }
+}
 #[test]
 fn saved_pins_are_keyed_by_the_typed_host() {
     assert_eq!(
@@ -2930,13 +2972,14 @@ fn a_talking_name_is_bold_and_its_blue_follows_loudness() {
     // Quiet speech is bold and only a fourth of the way over to dark blue.
     let (quiet, bold) = super::voice_tag(white, 0.0);
     assert!(bold, "talking is bold");
-    assert_eq!(quiet, [153, 153, 204], "a fourth of the way to dark blue");
+    assert_eq!(quiet, [179, 217, 255], "quiet speech stays readable");
     // Loud speech reaches dark blue itself.
     let (loud, _) = super::voice_tag(white, 1.0);
-    assert_eq!(loud, [0, 0, 128], "full loudness is dark blue");
+    assert_eq!(loud, [64, 160, 255], "full loudness is bright blue");
     // The shade moves monotonically with the level in between...
     let mid = super::voice_tag(white, 0.5).0;
-    for i in 0..3 {
+    assert_eq!(mid[2], 255);
+    for i in 0..2 {
         assert!(
             mid[i] < quiet[i] && mid[i] > loud[i],
             "channel {i}: {mid:?}"

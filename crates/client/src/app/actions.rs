@@ -377,7 +377,19 @@ impl App {
                 self.voice.set_volume(value);
                 Ok(())
             }
-            UiAction::SetVolume { channel, value } => self.audio.set_volume(&channel, value),
+            UiAction::SetVolume { channel, value } => {
+                if channel == "master" {
+                    self.voice.set_master_volume(value);
+                }
+                self.audio.set_volume(&channel, value)
+            }
+            UiAction::PreviewVoice(prefs) => {
+                self.voice.apply_settings(&bri_ui::api::Settings {
+                    prefs,
+                    ..Default::default()
+                });
+                Ok(())
+            }
             UiAction::RefreshVoiceDevices => {
                 self.ui
                     .apply(UiUpdate::VoiceDevices(crate::voice::input_devices()));

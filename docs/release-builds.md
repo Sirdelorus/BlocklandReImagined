@@ -239,3 +239,26 @@ new progress entry. Preserve unresolved player reports and validation limits.
 Re-attaching one platform to an existing release: run `mac-release-asset.yml`
 or `linux-release-asset.yml` with the release tag, the release commit and
 publish on. They never replace an asset.
+
+## Generated default NPC voice Add-On
+
+`packages/default-addons.json` schema 3 includes native generated Add-Ons as
+`generated` entries, in addition to repository `path` and imported `original`
+entries. `npc_popculture` uses the pinned `npc-reactions` recipe; its manifest
+turns on `npc_popculture_rules` immediately after it. Both ship enabled in a
+fresh release. Existing explicit user choices remain authoritative.
+
+`addon_bundle.py build/upload` generates all 118 recordings and the current
+companion, and bundle schema 3 carries them outside Git. Source processing needs
+`python -m pip install numpy scipy soundfile`; bootstrap checks those prerequisites.
+CI downloads the verified bundle, without reaching external soundboard sites.
+All platform packagers reject a missing/stale recipe, changed recording, missing
+companion or default omitted from the enabled package list. The recording receipt
+retains original attribution, URLs, hashes and notices in the shipped content.
+`release.py` refreshes the bundle when the recipe, policy, catalog or builder changes.
+
+Private preview folders can use `package_playtest.ps1 -SkipArchive`; manifest,
+content/default-Add-On and startup verification still apply. Public releases keep
+archive generation. Do not publish a new release merely to prepare a playtest.
+
+Bundle schema 4 requires imported-generation receipts: importer sources and normal/build path dependencies, embedded ports, workspace manifest/lockfile and bundling code are tied to every generated file and companion. Packaging rejects unstamped, stale or modified imports. A pinned original ZIP and a new engine commit do not establish fresh generated behavior. Rebuild with the current importer rather than relabeling an old bundle. Release refresh conservatively includes Rust dependency changes.

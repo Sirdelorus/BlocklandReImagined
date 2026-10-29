@@ -817,6 +817,8 @@ pub enum UiAction {
     /// List the microphones again (Options opened): the answer is
     /// [`UiUpdate::VoiceDevices`].
     RefreshVoiceDevices,
+    /// Live local microphone settings, without persisting the draft.
+    PreviewVoice(BTreeMap<String, String>),
     /// Open a web page in the player's browser (a new release's page).
     OpenUrl(String),
     /// Show the saves folder, where old `.bls` saves can be dropped, in
@@ -1872,6 +1874,8 @@ pub struct VoiceIndicator {
     /// is requested and allowed by the user's settings. Level is finite and
     /// normalized to 0..=1.
     pub microphone: bool,
+    /// The host has muted this player's voice.
+    pub server_muted: bool,
 }
 /// Live microphone input state for the Voice settings meter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -2059,6 +2063,13 @@ pub enum UiUpdate {
         voice_chat: bool,
         /// The players this player has muted locally, by owner id.
         voice_muted: Vec<u64>,
+        /// The players an admin has muted on the host, by owner id; empty
+        /// when the host does not run voice chat.
+        server_voice_muted: Vec<u64>,
+        /// The players heard speaking right now, by owner id (the F2 list's
+        /// Voice column says "On" for them). Players this player has muted
+        /// locally are left out by the sender.
+        voice_speaking: Vec<u64>,
     },
     MiniGames(MiniGameUiState),
     MiniGameInvite(MiniGameInvitation),

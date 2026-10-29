@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 pub const MAX_CUES: usize = 4096;
 pub const MAX_SECTION_MEMBERS: usize = 65_536;
+/// Shared metadata capacity; material/geometry admission has independent bounds.
+pub const MAX_SECTION_GROUPS: usize = 1024;
 pub const MAX_SECTION_LOOKS: usize = 256;
 pub const MAX_SECTION_QUADS: usize = 65_536;
 pub const MAX_SECTION_DRAW_QUADS: usize = 524_288;
@@ -221,6 +223,9 @@ pub enum CueKind {
     /// `WeaponSound` at `volume` times the profile's own (an Add-On's
     /// `sound_at` with a volume): a shout carries, a whisper does not.
     SoundShaped {
+        /// Explicit actor attribution for authored dialogue, absent for SFX.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speaker: Option<u64>,
         profile: String,
         volume: f32,
         pitch: f32,
@@ -541,6 +546,13 @@ impl Cue {
             );
         }
         if let CueKind::SoundShaped {
+            speaker: Some(actor),
+            ..
+        } = &self.kind
+        {
+            ensure!(*actor > 0, "Invalid speech actor");
+        }
+        if let CueKind::SoundShaped {
             volume,
             pitch,
             radius,
@@ -685,6 +697,7 @@ mod tests {
             tick: 1,
             position: [0.; 3],
             kind: CueKind::SoundShaped {
+                speaker: None,
                 profile: "radioBlip".into(),
                 volume,
                 pitch: 1.0,

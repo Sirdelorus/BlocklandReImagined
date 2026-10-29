@@ -215,7 +215,9 @@ const VOICE_SLIDER: &str = "OptAudioVolumeVoice";
 const VOICE_DEVICE_MENU: &str = "OptVoiceDeviceMenu";
 const VOICE_MODE_MENU: &str = "OptVoiceModeMenu";
 /// Height of the Voice section, including its microphone level preview.
-const VOICE_HEIGHT: i32 = 126;
+const VOICE_HEIGHT: i32 = 350;
+const VOICE_GAIN: &str = "OptVoiceMicGain";
+const VOICE_THRESHOLD: &str = "OptVoiceThreshold";
 const VOICE_METER: &str = "OptVoiceActivityMeter";
 const VOICE_MODES: [(&str, VoiceMode); 3] = [
     ("Push-to-Talk", VoiceMode::PushToTalk),
@@ -562,6 +564,8 @@ const READOUTS: &[&str] = &[
     "OptAudioVolumeSim",
     MUSIC_SLIDER,
     VOICE_SLIDER,
+    VOICE_GAIN,
+    VOICE_THRESHOLD,
     "SliderControlsMouseSensitivity",
     "slider_KeyboardTurnSpeed",
     "SliderGraphicsAnisotropy",
@@ -572,6 +576,8 @@ const READOUTS: &[&str] = &[
 /// The text a slider's readout shows for `value`.
 fn readout(slider: &str, value: f32) -> String {
     match slider {
+        VOICE_GAIN => format!("{value:.1}x"),
+        VOICE_THRESHOLD => format!("{:.0}%", value * 100.0),
         FOV_SLIDER | DISTANCE_SLIDER => format!("{value:.0}"),
         "SliderGraphicsAnisotropy" => {
             // As `TextureFiltering::from_v20` rounds it.
@@ -1150,43 +1156,77 @@ fn audio_pane(v: &mut View) {
         return;
     };
     hide_empty_fillers(v, pane);
-    let (volume, options) = (find_section(v, "Volume"), find_section(v, "Audio Options"));
-    let voice_home = match (volume, options) {
-        (Some(volume), Some(options)) => {
-            let room = |v: &View, n: NodeId| {
-                PANE_BOTTOM - v.node(n).ctrl.position[1] - content_bottom(v, n) - 6 - 3
-            };
-            // The Voice section goes under whichever column has room for it,
-            // the other column running the full height.
-            Some(
-                if room(v, options) >= VOICE_HEIGHT || room(v, options) >= room(v, volume) {
-                    options
-                } else {
-                    volume
-                },
-            )
-        }
-        _ => None,
+    let (Some(volume), Some(options)) =
+        (find_section(v, "Volume"), find_section(v, "Audio Options"))
+    else {
+        return;
     };
-    for title in ["Volume", "Audio Options"] {
-        if let Some(n) = find_section(v, title) {
-            let c = &mut v.nodes[n].ctrl;
-            c.extent[1] = PANE_BOTTOM - c.position[1];
+    // One compact game-audio column, one full voice column. Voice controls
+    // have a stable home and do not squeeze into whichever gap remains.
+    voice_section(v, pane, options);
+    v.nodes[volume].ctrl.position = [6, 7];
+    v.nodes[volume].ctrl.extent = [304, 158];
+    v.nodes[options].ctrl.position = [6, 171];
+    v.nodes[options].ctrl.extent = [304, PANE_BOTTOM - 171];
+    for section in [volume, options] {
+        for child in v.node(section).children.clone() {
+            let c = &mut v.nodes[child].ctrl;
+            if c.class == "GuiSwatchCtrl" && c.position == [2, 2] {
+                c.extent[0] = 300;
+            }
         }
     }
-    if let Some(home) = voice_home {
-        voice_section(v, pane, home);
+    for (i, name) in [
+        "OptAudioVolumeMaster",
+        "OptAudioVolumeShell",
+        "OptAudioVolumeSim",
+        MUSIC_SLIDER,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(slider) = v.id(name) {
+            let old = v.node(slider).ctrl.clone();
+            let label =
+                v.node(volume).children.iter().copied().find(|&n| {
+                    v.node(n).ctrl.class == "GuiTextCtrl" && labels(&v.node(n).ctrl, &old)
+                });
+            v.nodes[slider].ctrl.position = [108, 28 + i as i32 * 30];
+            v.nodes[slider].ctrl.extent = [184, 24];
+            if let Some(label) = label {
+                v.nodes[label].ctrl.position[1] = 31 + i as i32 * 30;
+            }
+        }
+    }
+    // Background/caption choices belong with the other game-audio choices.
+    for name in ["OptAudioMuteInBackground", "OptAudioCaptions"] {
+        if let Some(n) = v.id(name) {
+            if let Some(parent) = v.node(n).parent {
+                v.nodes[parent].children.retain(|&c| c != n);
+            }
+            v.nodes[n].parent = Some(options);
+            v.nodes[options].children.push(n);
+        }
+    }
+    let checks: Vec<_> = v
+        .node(options)
+        .children
+        .iter()
+        .copied()
+        .filter(|&n| v.node(n).ctrl.class == "GuiCheckBoxCtrl" && v.node(n).state.visible)
+        .collect();
+    for (i, n) in checks.into_iter().enumerate() {
+        v.nodes[n].ctrl.position = [12, 27 + i as i32 * 23];
+        v.nodes[n].ctrl.extent = [280, 22];
     }
 }
 
 /// The Voice section: input selection, voice activity and microphone preview.
 /// It takes the lower part of `home`'s column and looks like the sections around it.
 fn voice_section(v: &mut View, pane: NodeId, home: NodeId) {
-    let top = v.node(home).ctrl.position[1] + (content_bottom(v, home) + 6).max(0);
-    let top = top.min(PANE_BOTTOM - VOICE_HEIGHT);
+    let top = 7;
     let mut home_ctrl = v.node(home).ctrl.clone();
-    let (x, width) = (home_ctrl.position[0], home_ctrl.extent[0]);
-    v.nodes[home].ctrl.extent[1] = (top - 3 - home_ctrl.position[1]).max(0);
+    let (x, width) = (313, 303);
     let bar = v.node(home).children.iter().copied().find(|&k| {
         let c = &v.node(k).ctrl;
         c.class == "GuiSwatchCtrl" && c.position == [2, 2]
@@ -1200,7 +1240,7 @@ fn voice_section(v: &mut View, pane: NodeId, home: NodeId) {
     home_ctrl.name = None;
     home_ctrl.children.clear();
     home_ctrl.position = [x, top];
-    home_ctrl.extent = [width, PANE_BOTTOM - top];
+    home_ctrl.extent = [width, (PANE_BOTTOM - top).max(VOICE_HEIGHT)];
     let section = v.add(pane, home_ctrl);
     for (source, text) in [(bar, None), (title, Some("Voice"))] {
         let Some(source) = source else { continue };
@@ -1210,17 +1250,29 @@ fn voice_section(v: &mut View, pane: NodeId, home: NodeId) {
         if let Some(text) = text {
             c.text = Some(text.into());
         }
+        if c.class == "GuiSwatchCtrl" {
+            c.extent[0] = width - 4;
+        }
         v.add(section, c);
     }
-    let menu_x = 104;
+    let mut enabled = ctrl(
+        "GuiCheckBoxCtrl",
+        "GuiCheckBoxProfile",
+        Rect::new(10, 29, 280, 22),
+    );
+    enabled.name = Some("OptVoiceEnabled".into());
+    enabled.variable = Some("$pref::Voice::Enabled".into());
+    enabled.text = Some("Enable voice chat".into());
+    v.add(section, enabled);
+    let menu_x = 100;
     for (row, (label, menu)) in [
         ("Input Device:", VOICE_DEVICE_MENU),
-        ("Voice Activity:", VOICE_MODE_MENU),
+        ("Transmit:", VOICE_MODE_MENU),
     ]
     .into_iter()
     .enumerate()
     {
-        let y = 28 + row as i32 * 28;
+        let y = 60 + row as i32 * 30;
         let mut text = ctrl(
             "GuiTextCtrl",
             "GuiTextProfile",
@@ -1236,16 +1288,77 @@ fn voice_section(v: &mut View, pane: NodeId, home: NodeId) {
         popup.name = Some(menu.into());
         v.add(section, popup);
     }
-    let mut meter_label = ctrl("GuiTextCtrl", "GuiTextProfile", Rect::new(10, 86, 92, 18));
+    let mut meter_label = ctrl("GuiTextCtrl", "GuiTextProfile", Rect::new(10, 128, 92, 18));
     meter_label.text = Some("Input Level:".into());
     v.add(section, meter_label);
     let mut meter = ctrl(
         "GuiProgressCtrl",
         "GuiProgressProfile",
-        Rect::new(menu_x, 86, (width - menu_x - 10).max(60), 12),
+        Rect::new(menu_x, 130, width - menu_x - 10, 12),
     );
     meter.name = Some(VOICE_METER.into());
     v.add(section, meter);
+    let mut status = text(
+        "GuiTextProfile",
+        Rect::new(10, 149, width - 20, 18),
+        "Microphone preview stays local",
+    );
+    status.name = Some("OptVoiceStatus".into());
+    v.add(section, status);
+    for (name, label, y, range) in [
+        (VOICE_GAIN, "Mic gain:", 180, "0 4"),
+        (VOICE_THRESHOLD, "Open above:", 218, "0 0.2"),
+    ] {
+        v.add(
+            section,
+            text("GuiTextProfile", Rect::new(10, y + 3, 90, 20), label),
+        );
+        let mut slider = ctrl(
+            "GuiSliderCtrl",
+            "GuiSliderProfile",
+            Rect::new(100, y, width - 110, 24),
+        );
+        slider.name = Some(name.into());
+        slider.fields.insert("range".into(), range.into());
+        v.add(section, slider);
+    }
+    // Put incoming voice volume alongside microphone controls.
+    if let Some(slider) = v.id(VOICE_SLIDER) {
+        if let Some(parent) = v.node(slider).parent {
+            let old = v.node(slider).ctrl.clone();
+            let label =
+                v.node(parent).children.iter().copied().find(|&n| {
+                    v.node(n).ctrl.class == "GuiTextCtrl" && labels(&v.node(n).ctrl, &old)
+                });
+            if let Some(label) = label {
+                v.set_visible(label, false);
+            }
+            v.nodes[parent].children.retain(|&n| n != slider);
+        }
+        v.nodes[slider].parent = Some(section);
+        v.nodes[slider].ctrl.position = [100, 256];
+        v.nodes[slider].ctrl.extent = [width - 110, 24];
+        v.nodes[section].children.push(slider);
+        v.add(
+            section,
+            text("GuiTextProfile", Rect::new(10, 259, 90, 20), "Hear voices:"),
+        );
+    }
+    let mut hint = text(
+        "GuiTextProfile",
+        Rect::new(10, 293, width - 20, 20),
+        "Push-to-talk: Controls > Voice Chat",
+    );
+    hint.name = Some("OptVoiceHint".into());
+    v.add(section, hint);
+    v.add(
+        section,
+        text(
+            "GuiTextProfile",
+            Rect::new(10, 317, width - 20, 20),
+            "Voice activity: headphones recommended.",
+        ),
+    );
 }
 
 /// Name of the dropdown that picks which game's controls are shown, and of
@@ -1292,6 +1405,7 @@ pub struct Options {
     vehicle_node: Option<NodeId>,
     /// A volume slider was dragged, so its channel plays the draft value.
     previewed: bool,
+    voice_previewed: bool,
     /// The microphones the Voice menu lists after Default (the saved one
     /// too when it is unplugged), and the system's list they came from.
     voice_names: Vec<String>,
@@ -1322,6 +1436,7 @@ impl Options {
             invert_node: None,
             vehicle_node: None,
             previewed: false,
+            voice_previewed: false,
             voice_names: Vec::new(),
             voice_listed: Vec::new(),
         };
@@ -1348,6 +1463,22 @@ impl Options {
         for &(name, pref, _) in VOLUMES {
             s.slider(name, volume(&core.prefs, pref));
         }
+        if let Some(n) = s.view.id("OptVoiceEnabled") {
+            s.view
+                .set_bool(n, core.prefs.bool_or("$pref::Voice::Enabled", true));
+        }
+        s.slider(
+            VOICE_GAIN,
+            core.prefs
+                .f32_or("$pref::Voice::MicVolume", 1.0)
+                .clamped(0.0, 4.0),
+        );
+        s.slider(
+            VOICE_THRESHOLD,
+            core.prefs
+                .f32_or("$pref::Voice::Threshold", 0.02)
+                .clamped(0.0, 0.2),
+        );
         s.voice_menus(&core.prefs, &core.voice_devices);
         s.slider(
             "SliderControlsMouseSensitivity",
@@ -2581,6 +2712,18 @@ impl Options {
         if let Some(name) = self.selected_voice_device() {
             self.draft.set(VOICE_DEVICE, name);
         }
+        for (name, pref, max) in [
+            (VOICE_GAIN, "$pref::Voice::MicVolume", 4.0),
+            (VOICE_THRESHOLD, "$pref::Voice::Threshold", 0.2),
+        ] {
+            if let Some(n) = self.view.id(name) {
+                let value = self.view.num(n);
+                if !value.is_finite() {
+                    return Err("Microphone settings must be finite.".into());
+                }
+                self.draft.set(pref, value.clamped(0.0, max).to_string());
+            }
+        }
         for &(name, pref, _) in VOLUMES {
             if let Some(n) = self.view.id(name) {
                 let v = self.view.num(n);
@@ -2788,6 +2931,9 @@ impl Screen for Options {
         }
         core.options_open = false;
         core.voice_preview_active = false;
+        if self.voice_previewed && !self.committed {
+            core.request(UiAction::PreviewVoice(self.initial.overrides()));
+        }
         core.remap_all = false;
         core.remap_target = None;
         core.profiles.viewed = DEFAULT_PROFILE.into();
@@ -2796,6 +2942,28 @@ impl Screen for Options {
         self.refresh_binds(core);
         if core.voice_devices != self.voice_listed {
             self.voice_menus(&core.prefs, &core.voice_devices);
+        }
+        if let Some(n) = self.view.id("OptVoiceStatus") {
+            let p = core.voice_preview;
+            self.view.set_text(
+                n,
+                if !p.enabled {
+                    "Microphone off"
+                } else if !p.available {
+                    "Microphone unavailable; retrying"
+                } else {
+                    "Input preview stays local"
+                },
+            );
+        }
+        if let Some(n) = self.view.id("OptVoiceHint") {
+            self.view.set_text(
+                n,
+                format!(
+                    "Hold {} to talk (change in Controls)",
+                    core.key_name("voiceTalk")
+                ),
+            );
         }
         if let Some(meter) = self.view.id(VOICE_METER) {
             let preview = core.voice_preview;
@@ -2828,6 +2996,19 @@ impl Screen for Options {
                 .name
                 .clone()
                 .unwrap_or_default();
+            if [
+                VOICE_DEVICE_MENU,
+                VOICE_MODE_MENU,
+                VOICE_GAIN,
+                VOICE_THRESHOLD,
+                "OptVoiceEnabled",
+            ]
+            .contains(&name.as_str())
+                && self.collect().is_ok()
+            {
+                self.voice_previewed = true;
+                core.request(UiAction::PreviewVoice(self.draft.overrides()));
+            }
             if let Some(&(_, _, channel)) = VOLUMES.iter().find(|(n, _, _)| *n == name) {
                 let value = self.view.num(ev.node);
                 if value.is_finite() {
@@ -4187,12 +4368,16 @@ mod tests {
 
     #[test]
     fn voice_chat_volume_is_a_slider_of_its_own() {
-        let mut ui = fixture();
+        let mut ui = sectioned();
         let mut s = Options::new(&ui.core);
         let voice = s.view.id(VOICE_SLIDER).expect("a Voice Chat slider");
         let music = s.view.id(MUSIC_SLIDER).unwrap();
         // Its own row under Music, with its own readout.
-        assert!(s.view.node(voice).ctrl.position[1] > s.view.node(music).ctrl.position[1]);
+        assert_ne!(
+            s.view.node(voice).parent,
+            s.view.node(music).parent,
+            "voice volume belongs to Voice"
+        );
         assert_eq!(
             s.view
                 .text_of(s.view.id(&format!("{VOICE_SLIDER}Value")).unwrap()),

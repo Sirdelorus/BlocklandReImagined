@@ -855,16 +855,15 @@ fn aimed_at(camera: Vec3, aim: Vec3, feet: Vec3, eye: Vec3, radius: f32) -> bool
     let along_aim = (point - camera).dot(aim) / a.max(1e-6);
     along_aim > 0.0 && (camera + aim * along_aim).distance(point) <= radius
 }
-/// The dark blue a talking player's name reaches at full loudness.
-const DARK_BLUE: [u8; 3] = [0, 0, 128];
+/// Speech blue stays legible in dark scenes.
+const SPEECH_BLUE: [u8; 3] = [64, 160, 255];
 
 /// A talking player's name tag: bold, and blue in the shade their loudness
-/// earns — quiet stays near their colour (a fourth of the way over), loud
-/// goes dark blue. The old [ ] brackets are gone with the indicator.
+/// earns: quiet stays near their colour, louder speech becomes brighter blue. The old [ ] brackets are gone with the indicator.
 fn voice_tag(base: [u8; 3], level: f32) -> ([u8; 3], bool) {
     let t = (0.4 + 0.6 * level.clamped(0.0, 1.0)).clamped(0.0, 1.0);
     (
-        [0, 1, 2].map(|i| ((base[i] as f32) * (1.0 - t) + DARK_BLUE[i] as f32 * t).round() as u8),
+        [0, 1, 2].map(|i| ((base[i] as f32) * (1.0 - t) + SPEECH_BLUE[i] as f32 * t).round() as u8),
         true,
     )
 }
@@ -991,11 +990,12 @@ fn name_tags(
             [0, 1, 2].map(|i| (c[i].clamped(0.0, 1.0) * 255.0).round() as u8)
         });
         let level = levels.get(owner).copied().unwrap_or(0.0);
-        let (color, bold) = if speaking.contains(owner) {
-            voice_tag(base, level)
-        } else {
-            (base, false)
-        };
+        let (color, bold) =
+            if speaking.contains(owner) || view.vitals.get(owner).is_some_and(|v| v.talking) {
+                voice_tag(base, level)
+            } else {
+                (base, false)
+            };
         tags.push(bri_ui::api::NameTag {
             x,
             y,
@@ -1166,6 +1166,31 @@ fn camera_eye(
         },
     }
 }
+/// Apply presentation effects to an already composed camera. Input look limits
+/// belong to Controls: the chase boom's cameraTilt can put the actual view past
+/// vertical. Clamping it here turns the picture away from the boom's pivot.
+fn finish_camera(
+    controls: &Controls,
+    eye: Vec3,
+    (yaw, pitch, roll): (f32, f32, f32),
+    lean_tilt: f32,
+) -> (Vec3, f32, f32, f32) {
+    // A rule's camera_shake jitters the view alone, not the aim.
+    let jolt = controls.camera_jolt();
+    let eye = if jolt.offset == [0.0, 0.0] {
+        eye
+    } else {
+        let right = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+        eye + right * jolt.offset[0] + Vec3::Y * jolt.offset[1]
+    };
+    (
+        eye,
+        yaw + jolt.yaw,
+        pitch + jolt.pitch,
+        roll - lean_tilt + jolt.roll,
+    )
+}
+
 /// The view's forward, right and up for a look turned by `yaw` then pitched
 /// by `pitch`, as Torque builds the eye transform (`zmat(yaw) * xmat(pitch)`).
 /// Right stays level, so looking straight up or down (v20's look limits are
@@ -1740,6 +1765,7 @@ impl PlatformApp for App {
     }
     fn focus_changed(&mut self, focused: bool) {
         self.audio.set_focused(focused);
+        self.voice.set_focused(focused);
         if focused {
             // Back from an editor, maybe: look for Add-On edits.
             self.addons.edits.check();
