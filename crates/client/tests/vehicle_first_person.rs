@@ -877,6 +877,21 @@ fn the_tank_turret_keeps_its_aim_through_seat_changes_for_gunner_and_watcher(
     let content = f.root.clone();
     let (tank_id, _) = vehicles(f);
     let tank = definition(f, tank_id)?;
+    if !f.content {
+        // This test now drives, rather than only changing seats. The small
+        // fixture room let the tank drive off its finite floor while the
+        // two clients caught up. Give its bounded turns a driving surface.
+        let mut rooms =
+            bri_content::testing::map_bundle::rooms_for(bri_client::content::LOADABLE_MAPS);
+        let room = rooms
+            .iter_mut()
+            .find(|r| r.id == SLATE)
+            .context("Slate fixture")?;
+        room.half += tank.max_speed * 20.0; // two turns, each budgeted ten seconds
+        let dir = bri_package::packages::PackageSet::load_root(&f.root)?
+            .role_dir(&f.root, "map_bundle")?;
+        bri_content::testing::map_bundle::write_bundle(&dir, &rooms)?;
+    }
     let scratch = f.state()?;
     let state = scratch.path().to_path_buf();
     let mut host = app(&content, &state, "Host")?;
@@ -980,6 +995,88 @@ fn the_tank_turret_keeps_its_aim_through_seat_changes_for_gunner_and_watcher(
     let off = (guest.controls.yaw - along + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
     ensure!(off.abs() < 0.1, "the gunner looks {off} off the barrel");
+    // A second player drives while the guest leaves the mouse still. The
+    // turret's world heading must stay fixed through left and right turns;
+    // agreement between replicated relative aims alone misses this regression.
+    board(&mut [&mut host, &mut guest], 0)?;
+    seat_to(&mut [&mut host, &mut guest], 0, &tank, driver, None)?;
+    run_for(&mut [&mut host, &mut guest], 1.0)?;
+    let fixed_yaw = guest.controls.yaw;
+    let fixed_pitch = guest.controls.pitch;
+    let wrap = |a: f32| {
+        (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+    };
+    for turn in [HeldControl::Left, HeldControl::Right] {
+        let start = host
+            .network_view()
+            .context("driver view")?
+            .vehicle_poses
+            .values()
+            .next()
+            .context("driver tank")?
+            .rotation;
+        held(&mut host, HeldControl::Forward, true)?;
+        held(&mut host, turn, true)?;
+        // Wait for the observed turn, rather than sending a fixed count of
+        // frames: slow clients otherwise drive much farther in server time.
+        until(
+            &mut [&mut host, &mut guest],
+            "driver turns the hull",
+            10,
+            |apps| {
+                request(
+                    apps[0],
+                    UiAction::Game(GameAction::Look {
+                        yaw: if turn == HeldControl::Left {
+                            -0.025
+                        } else {
+                            0.025
+                        },
+                        pitch: 0.0,
+                    }),
+                )?;
+                ensure!(
+                    wrap(apps[1].controls.yaw - fixed_yaw).abs() < 1e-4,
+                    "driver's {turn:?} turn dragged gunner aim from {fixed_yaw} to {}",
+                    apps[1].controls.yaw
+                );
+                ensure!(
+                    (apps[1].controls.pitch - fixed_pitch).abs() < 1e-4,
+                    "driving changed gunner pitch"
+                );
+                let pose = apps[0]
+                    .network_view()
+                    .context("host view")?
+                    .vehicle_poses
+                    .values()
+                    .next()
+                    .context("host tank")?;
+                let forward = Quat::from_array(pose.rotation) * Vec3::NEG_Z;
+                let before = Quat::from_array(start) * Vec3::NEG_Z;
+                let turned = wrap(forward.x.atan2(-forward.z) - before.x.atan2(-before.z));
+                let sign = if turn == HeldControl::Left { -1.0 } else { 1.0 };
+                Ok(turned * sign > 0.15 && pose.wheel_contact.iter().any(|c| *c))
+            },
+        )?;
+        held(&mut host, turn, false)?;
+        held(&mut host, HeldControl::Forward, false)?;
+        run_for(&mut [&mut host, &mut guest], 0.5)?;
+        for app in [&host, &guest] {
+            let pose = app
+                .network_view()
+                .context("crew view")?
+                .vehicle_poses
+                .values()
+                .next()
+                .context("crew tank")?;
+            let forward = Quat::from_array(pose.rotation) * Vec3::NEG_Z;
+            let world_yaw = forward.x.atan2(-forward.z) - pose.turret_aim[0];
+            ensure!(
+                wrap(world_yaw - fixed_yaw).abs() < 0.05,
+                "replicated barrel drifted from held world aim: {world_yaw} vs {fixed_yaw}"
+            );
+        }
+    }
     for app in [&mut guest, &mut host] {
         request(app, UiAction::Disconnect)?;
         app.gpu_stopped();

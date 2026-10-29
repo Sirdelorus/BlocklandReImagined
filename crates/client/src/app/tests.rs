@@ -1004,10 +1004,29 @@ fn native_weapon_catalog_startup_and_headless_host(f: &ContentRoot) -> anyhow::R
     let items = &app.content.weapons.pack.items;
     let base = items.keys().filter(|id| !id.contains(':')).count();
     assert_eq!(base, base_weapon_items(&f.root)?);
-    let all = items.len();
-    assert_eq!(app.build.tool_ui.server_catalog().items.len(), all);
-    assert_eq!(app.content.datablocks["ItemData"].len(), all);
-    assert_eq!(app.content.item_physics.bounds.len(), all);
+    // Authored hidden items remain usable by scripts and physics, but are
+    // deliberately absent from player-facing item selectors.
+    let selectable: BTreeSet<_> = items
+        .iter()
+        .filter(|(_, item)| !item.hidden)
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(app.build.tool_ui.server_catalog().items, selectable);
+    assert_eq!(
+        app.content.datablocks["ItemData"]
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<BTreeSet<_>>(),
+        selectable
+    );
+    assert_eq!(
+        app.content
+            .item_physics
+            .bounds
+            .keys()
+            .collect::<BTreeSet<_>>(),
+        items.keys().collect::<BTreeSet<_>>()
+    );
     app.ui.core.request(UiAction::HostGame {
         map: "v20/add-ons/map_bedroom/bedroom.mis".into(),
         mode: ServerMode::SinglePlayer,
@@ -1719,7 +1738,6 @@ fn leaving_a_game_forgets_its_seat_eyes_and_liquids(f: &ContentRoot) -> anyhow::
     // What a game in progress leaves behind: a seat, a rider's eye, a
     // tumble, eyes the camera drew from and the map's liquids.
     app.mounts.seated_on = Some((7, 1));
-    app.mounts.mount_heading = Some(1.0);
     app.mounts.takes_turret = true;
     app.mounts.posed_eye = Some(Vec3::ONE);
     app.mounts.tumble = Some(9);
@@ -1740,7 +1758,6 @@ fn leaving_a_game_forgets_its_seat_eyes_and_liquids(f: &ContentRoot) -> anyhow::
     app.disconnect();
     // The next game starts on foot, with nothing of the last one's view.
     assert_eq!(app.mounts.seated_on, None);
-    assert_eq!(app.mounts.mount_heading, None);
     assert!(!app.mounts.takes_turret);
     assert_eq!(app.mounts.posed_eye, None);
     assert_eq!(app.mounts.tumble, None);

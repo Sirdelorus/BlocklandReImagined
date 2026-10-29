@@ -640,6 +640,7 @@ pub struct HudRegionDraw {
     pub basis: Option<[f32; 2]>,
     /// A `name_tags` claim's style for the names over players' heads.
     pub name_tags: Option<bri_content::hud::NameTagStyle>,
+    pub speakers: Option<bri_content::hud::SpeakerStyle>,
 }
 /// A key players can bind to a package's command in Options → Controls,
 /// from an enabled package's `binds.json`.
@@ -1277,6 +1278,8 @@ pub enum PlantError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlayerRow {
     pub id: u64,
+    /// Host-classified bot: kept for team management, hidden from human lists.
+    pub bot: bool,
     /// This viewer ignores the player's trust invites.
     pub ignoring: bool,
     pub name: String,
@@ -2286,4 +2289,12 @@ impl BindInput {
             BindInput::MouseY => "Mouse Y".into(),
         }
     }
+}
+
+/// A locally audible/eligible speaker, including a short release fade.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceSpeaker {
+    pub name: String,
+    pub label: String,
+    pub alpha: f32,
 }
