@@ -64,6 +64,7 @@ fn lit(cone: [f32; 4], soft: bool) -> Result<(i32, i32)> {
             position_radius: [0., 5., 0., 40.],
             color: [1., 1., 1., 0.],
             cone,
+            lamp_slot: [-1.; 4],
         }],
     )?;
     let pixels = render(&device, &queue, &mut renderer, &target, &[&scene], &[], &[])?;

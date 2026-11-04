@@ -68,6 +68,7 @@ fn lamp(w: f32) -> PointLight {
         position_radius: [0.0, 3.0, 0.0, 30.0],
         color: [1.0, 1.0, 1.0, w],
         cone: [0.0; 4],
+        lamp_slot: [-1.; 4],
     }
 }
 

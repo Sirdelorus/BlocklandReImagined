@@ -893,7 +893,72 @@ impl App {
             camera.atmosphere[0] *= scale;
             camera.atmosphere[1] = cap;
         }
+        // Vehicle lamps their drivers turned on light the world too. The cone
+        // ones may cast shadows, so they join the lamp budget before it is
+        // picked; the all-round ones stay unshadowed as before.
+        let vehicle_lights = self
+            .net
+            .attempt
+            .as_ref()
+            .and_then(|a| a.view.as_ref())
+            .map(|view| {
+                let vehicles = &self.vehicles;
+                let assets = &self.vehicle_assets;
+                let infos: Vec<_> = view
+                    .vehicles
+                    .values()
+                    .filter_map(|info| {
+                        let f = vehicles.frame(info.id)?;
+                        let body = glam::Mat4::from_scale_rotation_translation(
+                            glam::Vec3::splat(info.scale),
+                            f.rotation,
+                            f.position,
+                        );
+                        Some((
+                            info.id,
+                            body,
+                            info.lights,
+                            assets.driver_present(info),
+                            f.driver_jump_held,
+                            f.driver_reversing,
+                            info.definition.clone(),
+                        ))
+                    })
+                    .collect();
+                self.vehicle_assets.lamp_lights(infos)
+            })
+            .unwrap_or_default();
+        let lamp_candidates: Vec<bri_render::shadow::LampLight> = vehicle_lights
+            .iter()
+            .filter(|light| light.cone.iter().any(|word| *word != 0.))
+            .map(|light| bri_render::shadow::LampLight {
+                position: glam::Vec3::from([
+                    light.position_radius[0],
+                    light.position_radius[1],
+                    light.position_radius[2],
+                ]),
+                color: glam::Vec3::from([light.color[0], light.color[1], light.color[2]]),
+                outer: light.position_radius[3],
+            })
+            .collect();
+        renderer.set_runtime_lamps(&lamp_candidates);
         renderer.update_camera(frame.queue, &camera);
+        // Stamp the shadow slot each headlight won (-1 where it did not cast).
+        let slots = renderer.runtime_lamp_slots().to_vec();
+        let mut lamp_index = 0usize;
+        let vehicle_lights = vehicle_lights
+            .into_iter()
+            .map(|mut light| {
+                if light.cone.iter().any(|word| *word != 0.) {
+                    let slot = slots.get(lamp_index).copied().flatten();
+                    light.lamp_slot = [slot.map_or(-1., |s| s as f32); 4];
+                    lamp_index += 1;
+                } else {
+                    light.lamp_slot = [-1.; 4];
+                }
+                light
+            })
+            .collect::<Vec<_>>();
         // Only the zones the eye can see into are drawn.
         let zones = self
             .scene
@@ -1477,37 +1542,14 @@ impl App {
             .map(|light| bri_render::scene::PointLight {
                 position_radius: light.position.extend(light.radius).to_array(),
                 color: light.color.extend(0.).to_array(),
-                ..Default::default()
+                cone: [0.; 4],
+                lamp_slot: [-1.; 4],
             })
             .collect();
-        // Vehicle lamps their drivers turned on light the world too.
+        // Vehicle lamps their drivers turned on light the world too (their
+        // shadow slots were stamped before `update_camera`).
         let mut lights = lights;
-        if let Some(view) = self.net.attempt.as_ref().and_then(|a| a.view.as_ref()) {
-            let vehicles = &self.vehicles;
-            let assets = &self.vehicle_assets;
-            let infos: Vec<_> = view
-                .vehicles
-                .values()
-                .filter_map(|info| {
-                    let f = vehicles.frame(info.id)?;
-                    let body = glam::Mat4::from_scale_rotation_translation(
-                        glam::Vec3::splat(info.scale),
-                        f.rotation,
-                        f.position,
-                    );
-                    Some((
-                        info.id,
-                        body,
-                        info.lights,
-                        assets.driver_present(info),
-                        f.driver_jump_held,
-                        f.driver_reversing,
-                        info.definition.clone(),
-                    ))
-                })
-                .collect();
-            lights.extend(self.vehicle_assets.lamp_lights(infos));
-        }
+        lights.extend(vehicle_lights);
         lights.truncate(bri_render::scene::MAX_POINT_LIGHTS);
         // The map's own lamps, for the bodies they light, then the lights
         // past the shaded budget, fill what the effects leave.

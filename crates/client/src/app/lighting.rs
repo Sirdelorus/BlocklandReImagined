@@ -220,6 +220,7 @@ impl LightVolumeState {
                     position_radius: [l.position[0], l.position[1], l.position[2], l.outer],
                     color: [colour.x, colour.y, colour.z, bri_render::scene::ACTOR_LAMP],
                     cone,
+                    lamp_slot: [-1.; 4],
                 }
             })
             .collect()
@@ -252,6 +253,7 @@ pub(super) fn overflow_point_lights(
                 position_radius: [l.position[0], l.position[1], l.position[2], l.outer],
                 color: [l.color[0], l.color[1], l.color[2], 1.0],
                 cone: o.cone,
+                lamp_slot: [-1.; 4],
             }
         })
         .collect()

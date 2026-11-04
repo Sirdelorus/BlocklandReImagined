@@ -177,7 +177,8 @@ mod tests {
         PointLight {
             position_radius: [x, y, z, radius],
             color: [1.; 4],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         }
     }
 

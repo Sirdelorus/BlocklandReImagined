@@ -919,6 +919,7 @@ impl VehicleAssets {
                         0.,
                     ],
                     cone,
+                    lamp_slot: [-1.; 4],
                 });
             }
         }

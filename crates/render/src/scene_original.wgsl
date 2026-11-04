@@ -20,7 +20,8 @@ struct Camera {
     actor_suns:array<vec4<f32>,128>,
 };
 @group(0) @binding(0) var<uniform> camera:Camera;
-struct PointLight { position_radius:vec4<f32>, color:vec4<f32>, cone:vec4<f32> };
+// lamp_slot.x: the shadow slot this light casts from (-1 when it does not cast).
+struct PointLight { position_radius:vec4<f32>, color:vec4<f32>, cone:vec4<f32>, lamp_slot:vec4<f32> };
 // count.x lights; the grid (crate::light_grid) has its origin and inverse
 // cell size in grid_origin, its dimensions and 1 when built in grid_dims.
 struct PointLights { count:vec4<u32>, grid_origin:vec4<f32>, grid_dims:vec4<u32>, values:array<PointLight,256> };
@@ -66,7 +67,9 @@ fn point_sums(position:vec3<f32>,normal:vec3<f32>)->PointSums {
         var shaped=select(falloff*falloff,falloff,light.color.w>0.5);
         // color.w 2: the cubic curve 2 (1 - 3 t^2 + 2 t^3), t the distance over the radius.
         if light.color.w>1.5 {let t=min(distance/max(light.position_radius.w,0.0001),1.0); shaped=2.0*(1.0-3.0*t*t+2.0*t*t*t);}
-        let given=light.color.rgb*shaped*max(dot(n,delta/max(distance,0.0001)),0.0)*point_cone(light,-delta/max(distance,0.0001));
+        var given=light.color.rgb*shaped*max(dot(n,delta/max(distance,0.0001)),0.0)*point_cone(light,-delta/max(distance,0.0001));
+        // A headlight that won a shadow slot shades like the map's lamps.
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),position,n);}
         if light.color.w>0.5 && light.color.w<1.5 {sums.overflow+=given;} else {sums.others+=given;}
     }
     return sums;
@@ -113,7 +116,9 @@ fn vertex_point_illumination(position:vec3<f32>,normal:vec3<f32>)->vec3<f32> {
         let facing=max(dot(n,delta*inverseSqrt(max(d2,0.00000001))),0.0);
         var reach=1.0/(1.0+GL_QUADRATIC_ATTENUATION*d2);
         if light.color.w>1.5 {let t=sqrt(d2)/max(radius,0.0001); reach=2.0*(1.0-3.0*t*t+2.0*t*t*t);}
-        result+=light.color.rgb*facing*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))*reach;
+        var given=light.color.rgb*facing*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))*reach;
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),position,n);}
+        result+=given;
     }
     return result;
 }
@@ -222,7 +227,9 @@ fn actor_light(position:vec3<f32>,normal:vec3<f32>,own:vec4<f32>,body:vec4<f32>)
         let toward=light.position_radius.xyz-position;
         let dist=length(toward);
         if dist>(256.0-a0)/max(a1,0.01) {continue;}
-        sum+=material[1].y*light.color.rgb*(1.0/(a0+a1*dist))*max(dot(n,toward/max(dist,0.0001)),0.0)*actor_cone(light,-toward/max(dist,0.0001));
+        var given=material[1].y*light.color.rgb*(1.0/(a0+a1*dist))*max(dot(n,toward/max(dist,0.0001)),0.0)*actor_cone(light,-toward/max(dist,0.0001));
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),position,n);}
+        sum+=given;
     }
     if baked {
         return sum;
@@ -1112,7 +1119,9 @@ fn brick_point_glint(p:vec3<f32>,n:vec3<f32>,eye:vec3<f32>,power:f32)->vec3<f32>
             let fade=max(1.0-sqrt(d2)/max(radius,0.0001),0.0);
             attenuation=fade*fade;
         }
-        result+=light.color.rgb*attenuation*point_cone(light,-toward)*glint(n,toward,eye,power);
+        var given=light.color.rgb*attenuation*point_cone(light,-toward)*glint(n,toward,eye,power);
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),p,n);}
+        result+=given;
     }
     return result;
 }
@@ -1928,7 +1937,9 @@ fn metal_surface(v:VertexOut)->vec4<f32> {
         let radius=light.position_radius.w;
         if d2>=radius*radius {continue;}
         let rgb=linear_color(clamp(light.color.rgb,vec3<f32>(0.0),vec3<f32>(1.0)));
-        radiance+=rgb*ggx_light(n,delta*inverseSqrt(max(d2,0.00000001)),e,alpha,f0)*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))/(1.0+GL_QUADRATIC_ATTENUATION*d2);
+        var given=rgb*ggx_light(n,delta*inverseSqrt(max(d2,0.00000001)),e,alpha,f0)*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))/(1.0+GL_QUADRATIC_ATTENUATION*d2);
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),v.world_position,n);}
+        radiance+=given;
     }
     radiance*=cavity;
     return vec4<f32>(fogged(display_color(radiance),v.world_position),1.0);
@@ -2041,7 +2052,9 @@ fn physical_surface(v:VertexOut)->vec4<f32> {
         let radius=light.position_radius.w;
         if d2>=radius*radius {continue;}
         let rgb=linear_color(clamp(light.color.rgb,vec3<f32>(0.0),vec3<f32>(1.0)));
-        radiance+=rgb*ggx_light(n,delta*inverseSqrt(max(d2,0.00000001)),e,a,f0)*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))/(1.0+GL_QUADRATIC_ATTENUATION*d2);
+        var given=rgb*ggx_light(n,delta*inverseSqrt(max(d2,0.00000001)),e,a,f0)*point_cone(light,-delta*inverseSqrt(max(d2,0.00000001)))/(1.0+GL_QUADRATIC_ATTENUATION*d2);
+        if light.lamp_slot.x>=0.0 {given*=lamp_lit(u32(light.lamp_slot.x),v.world_position,n);}
+        radiance+=given;
     }
     // Glow, whatever the world's light.
     radiance+=material[2].rgb*textureSample(layer5,tiled,v.uv).rgb;

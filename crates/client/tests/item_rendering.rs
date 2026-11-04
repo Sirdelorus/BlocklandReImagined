@@ -380,7 +380,8 @@ fn additive_unlit_and_ordinary_alpha_pixels() -> Result<()> {
         &[PointLight {
             position_radius: [0., 0., 1., 5.],
             color: [4., 4., 4., 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         }],
     )?;
     assert_eq!(

@@ -206,7 +206,8 @@ fn brick_lights(
         .map(|l| bri_render::scene::PointLight {
             position_radius: l.position.extend(l.radius).to_array(),
             color: l.color.extend(0.0).to_array(),
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         })
         .collect();
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();

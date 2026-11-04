@@ -77,7 +77,8 @@ fn point_lights_update_and_clear_without_reuploading_geometry() -> Result<()> {
     let mut light = PointLight {
         position_radius: [0., 0., 1.5, 4.],
         color: [1., 0., 0., 0.],
-        ..Default::default()
+        cone: [0.; 4],
+        lamp_slot: [-1.; 4],
     };
     renderer.update_lights(&gpu.queue, &[light])?;
     let red = gpu.frame(&mut renderer, &[&mesh], &camera, (64, 64))?;
@@ -135,7 +136,8 @@ fn point_lights_light_objects_per_vertex_with_v20_attenuation() -> Result<()> {
         &[PointLight {
             position_radius: [0., 0., 1.5, 10.],
             color: [1., 1., 1., 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         }],
     )?;
     let lit = gpu.frame(&mut renderer, &[&small], &camera, (64, 64))?;
@@ -153,7 +155,8 @@ fn point_lights_light_objects_per_vertex_with_v20_attenuation() -> Result<()> {
         &[PointLight {
             position_radius: [0., 0., 0.8, 0.8],
             color: [5., 5., 5., 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         }],
     )?;
     let far = gpu.frame(&mut renderer, &[&large], &camera, (64, 64))?;
@@ -177,12 +180,14 @@ fn a_full_light_budget_lights_each_pixel_with_the_lights_that_reach_it() -> Resu
         PointLight {
             position_radius: [0.3, 0., 1.5, 4.],
             color: [0.6, 0., 0., 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         },
         PointLight {
             position_radius: [-0.3, 0.2, 1.2, 3.],
             color: [0., 0.5, 0.3, 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         },
     ];
     renderer.update_lights(&gpu.queue, &near)?;
@@ -193,7 +198,8 @@ fn a_full_light_budget_lights_each_pixel_with_the_lights_that_reach_it() -> Resu
         .map(|i| PointLight {
             position_radius: [20. + (i % 16) as f32 * 9., (i / 16) as f32 * 7., -30., 6.],
             color: [1., 1., 1., 0.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         })
         .collect();
     all.insert(100, near[0]);
@@ -1575,7 +1581,8 @@ fn brick_specular_responds_to_a_local_point_light() -> Result<()> {
                 &[PointLight {
                     position_radius: [0.0, 0.0, 1.5, 4.0],
                     color: [0.4, 0.4, 0.4, 0.0],
-                    ..Default::default()
+                    cone: [0.; 4],
+                    lamp_slot: [-1.; 4],
                 }],
             )?;
             let mut data = triangle([0.25, 0.25, 0.25, 1.0], 0.3, AlphaMode::Opaque);
@@ -1599,7 +1606,8 @@ fn brick_specular_responds_to_a_local_point_light() -> Result<()> {
                 &[PointLight {
                     position_radius: [0.0, 0.0, -1.0, 4.0],
                     color: [0.4, 0.4, 0.4, 0.0],
-                    ..Default::default()
+                    cone: [0.; 4],
+                    lamp_slot: [-1.; 4],
                 }],
             )?;
             let behind = gpu.frame(&mut renderer, &[&glossy], &camera, (64, 64))?;
@@ -1729,7 +1737,8 @@ fn ordinary_overlay_receives_darkness_and_local_light_but_unlit_stays_bright() -
                     &[PointLight {
                         position_radius: [0., 0., 1.5, 4.],
                         color: [1., 1., 1., 0.],
-                        ..Default::default()
+                        cone: [0.; 4],
+                        lamp_slot: [-1.; 4],
                     }],
                 )?;
                 let bright = gpu.frame(&mut renderer, &[&lit], &camera, (64, 64))?;
@@ -1786,7 +1795,8 @@ fn translucent_vertex_lit_material_does_not_emit_and_preserves_blending() -> Res
             &[PointLight {
                 position_radius: [0., 0., 1.5, 4.],
                 color: [1., 1., 1., 0.],
-                ..Default::default()
+                cone: [0.; 4],
+                lamp_slot: [-1.; 4],
             }],
         )?;
         let bright = gpu.frame(&mut renderer, &[&backdrop, &lit], &camera, (64, 64))?;
@@ -2426,7 +2436,8 @@ fn a_cubic_light_falls_off_along_the_smooth_curve() -> Result<()> {
         &[PointLight {
             position_radius: [0., 0., 1.5, 2.],
             color: [1., 1., 1., 2.],
-            ..Default::default()
+            cone: [0.; 4],
+            lamp_slot: [-1.; 4],
         }],
     )?;
     let lit = gpu.frame(&mut renderer, &[&small], &camera, (64, 64))?;

@@ -2999,7 +2999,8 @@ impl MapLightBinding {
 }
 /// The colour `w` of a map lamp that only lit moving bodies take (`actor_light`); the map's surfaces have its light already.
 pub const ACTOR_LAMP: f32 = 3.0;
-/// Native unshadowed point illumination. Radius and RGB come from the effect clock.
+/// A live point light (effects and vehicle lamps). Radius and RGB come from
+/// the effect clock.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PointLight {
@@ -3012,6 +3013,13 @@ pub struct PointLight {
     /// and `cos outer` times that scale ([`spot_words`] without its all-round
     /// sentinel); all zero shines all round.
     pub cone: [f32; 4],
+    /// The lamp shadow slot this light casts from, or -1 when it does not
+    /// cast (the map's shaded lamps and the runtime ones share the slots):
+    /// its reach is multiplied by that slot's `lamp_lit`, so a vehicle
+    /// headlight shades like a map lamp. The shader reads `.x`; the field is
+    /// a full vec4 so this struct stays 16-byte aligned for the WGSL uniform
+    /// array stride (a 52-byte struct would be stored at 64).
+    pub lamp_slot: [f32; 4],
 }
 
 /// Scenes a renderer has uploaded since it was made: what a frame's work
@@ -3424,6 +3432,12 @@ pub struct SceneRenderer {
     uploads: std::cell::Cell<UploadCounts>,
     volume: VolumeBinding,
     map_lights: MapLightBinding,
+    /// Runtime lamp candidates (vehicle headlights) for this frame, set by
+    /// [`Self::set_runtime_lamps`] before `update_camera`; they join the
+    /// map's shaded lamps in the shared shadow budget.
+    runtime_lamps: Vec<crate::shadow::LampLight>,
+    /// The slot each runtime candidate won in `update_camera`, or none.
+    runtime_slots: Vec<Option<usize>>,
     probe: crate::environment_probe::ProbeBinding,
     camera_layout: wgpu::BindGroupLayout,
     views: Vec<View>,
@@ -3514,7 +3528,7 @@ impl SceneRenderer {
                 sampler_entry(5),
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -3524,13 +3538,13 @@ impl SceneRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -3708,6 +3722,8 @@ impl SceneRenderer {
             uploads: Default::default(),
             volume,
             map_lights,
+            runtime_lamps: Vec::new(),
+            runtime_slots: Vec::new(),
             probe: crate::environment_probe::ProbeBinding::new(device, color_format),
             camera_layout,
             views: Vec::new(),
@@ -4709,6 +4725,18 @@ impl SceneRenderer {
         }
         self.modern_pipelines = Some(modern);
     }
+    /// Runtime lamps (vehicle headlights) that may cast this frame; call
+    /// before `update_camera`. They join the map's shaded lamps in the same
+    /// shadow budget and win a slot only where they rank.
+    pub fn set_runtime_lamps(&mut self, lamps: &[crate::shadow::LampLight]) {
+        self.runtime_lamps = lamps.to_vec();
+    }
+    /// The shadow slot each runtime lamp won this frame (after
+    /// `update_camera`), or none; index it as the lamps were given to
+    /// [`Self::set_runtime_lamps`].
+    pub fn runtime_lamp_slots(&self) -> &[Option<usize>] {
+        &self.runtime_slots
+    }
     /// Call once before encoding/submitting a frame. Multiple writes before a
     /// single submission would intentionally use the latest camera everywhere.
     pub fn update_camera(&mut self, queue: &wgpu::Queue, camera: &Camera) {
@@ -4726,12 +4754,21 @@ impl SceneRenderer {
             }
         }
         // Lamps cast only in the Unified modes (Classic keeps v20's look).
-        let lamps: &[crate::shadow::LampLight] = if camera.ambient[3] >= 0.5 {
-            &self.map_lights.lamps
-        } else {
-            &[]
-        };
-        let seen = if lamps.is_empty() {
+        let modern = camera.ambient[3] >= 0.5;
+        let map_lamps: &[crate::shadow::LampLight] =
+            if modern { &self.map_lights.lamps } else { &[] };
+        // Runtime lamps (vehicle headlights) join the same budget; the slot
+        // table holds `MAX_LIGHTS` entries, so candidates past it cannot be
+        // stamped and are left out.
+        let mut candidates: Vec<crate::shadow::LampLight> = map_lamps.to_vec();
+        if modern {
+            candidates.extend(
+                self.runtime_lamps
+                    .iter()
+                    .take(crate::map_lighting::MAX_LIGHTS.saturating_sub(map_lamps.len())),
+            );
+        }
+        let seen = if map_lamps.is_empty() {
             Vec::new()
         } else {
             self.map_lights.seen_near(self.views[0].eye)
@@ -4741,9 +4778,18 @@ impl SceneRenderer {
             Mat4::from_cols_array(&camera.view_projection),
             self.views[0].eye,
             Vec4::from(camera.sun_direction).truncate(),
-            lamps,
+            &candidates,
             &seen,
         );
+        // Which runtime candidate won a slot (the map's lamps own the first
+        // indices of `candidates`).
+        let offset = map_lamps.len();
+        self.runtime_slots = self
+            .runtime_lamps
+            .iter()
+            .enumerate()
+            .map(|(i, _)| self.shadows.lamp_slot_of(offset + i))
+            .collect();
     }
     /// Another view's camera for this frame (after `update_camera`, which
     /// fits the shadows every view reads to the player's view, unless
@@ -4818,7 +4864,10 @@ impl SceneRenderer {
                     .chain(light.color.iter())
                     .all(|v| v.is_finite())
                     && light.position_radius[3] >= 0.
-                    && light.color.iter().all(|v| *v >= 0.),
+                    && light.color.iter().all(|v| *v >= 0.)
+                    && (light.lamp_slot[0] == -1.
+                        || (light.lamp_slot[0] >= 0.
+                            && light.lamp_slot[0] < crate::shadow::MAX_LAMPS as f32)),
                 "Invalid point light"
             );
         }

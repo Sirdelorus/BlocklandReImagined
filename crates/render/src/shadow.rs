@@ -1252,6 +1252,13 @@ impl ShadowMaps {
         }
         self.player = uniform;
     }
+    /// The shadow slot candidate light `light` won this frame, if any: its
+    /// position among the slots, so a caller can stamp its own lights with it.
+    pub fn lamp_slot_of(&self, light: usize) -> Option<usize> {
+        self.lamps
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|l| l.light == light))
+    }
     /// The sun's part of `uniform` and the casters' matrices for `view`'s
     /// `cascades`, split along `forward` from `eye`.
     #[allow(clippy::too_many_arguments)]
