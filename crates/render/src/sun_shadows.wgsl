@@ -113,40 +113,45 @@ fn pcss_noise()->f32 {
     return fract(52.9829189*fract(dot(floor(sun_pixel),vec2<f32>(0.06711056,0.00583715))));
 }
 // The unit-disc tap layouts (tap i of n: radius sqrt((i+0.5)/n), angle
-// i*2.3999632), written out so no pixel evaluates a sqrt, cos and sin per tap.
+// i*2.3999632), written out so no pixel evaluates a sqrt, cos and sin per
+// tap. Entries follow the shortest path through the taps instead of spiral
+// order, so consecutive taps read neighbouring texels and the shadow map
+// stays in cache (same sample set, different evaluation order). A search
+// tap's nearer-taps-count-more weight is 1-dot(p,p) - its squared radius
+// from the centre - which equals the old index-based formula for any order.
 const PCSS_DISC_8:array<vec2<f32>,8>=array<vec2<f32>,8>(
-    vec2<f32>(0.25000000,0.00000000), vec2<f32>(-0.31929008,0.29249589),
-    vec2<f32>(0.04887243,-0.55687654), vec2<f32>(0.40244453,0.52491752),
-    vec2<f32>(-0.73853513,-0.13063637), vec2<f32>(0.69960487,-0.44503150),
-    vec2<f32>(-0.23400400,0.87048385), vec2<f32>(-0.44627149,-0.85926815),
+    vec2<f32>(-0.73853513,-0.13063637), vec2<f32>(-0.31929008,0.29249589),
+    vec2<f32>(-0.23400400,0.87048385), vec2<f32>(0.40244453,0.52491752),
+    vec2<f32>(0.25000000,0.00000000), vec2<f32>(0.69960487,-0.44503150),
+    vec2<f32>(0.04887243,-0.55687654), vec2<f32>(-0.44627149,-0.85926815),
 );
 const PCSS_DISC_16:array<vec2<f32>,16>=array<vec2<f32>,16>(
-    vec2<f32>(0.17677670,0.00000000), vec2<f32>(-0.22577218,0.20682583),
-    vec2<f32>(0.03455803,-0.39377118), vec2<f32>(0.28457125,0.37117274),
-    vec2<f32>(-0.52222320,-0.09237387), vec2<f32>(0.49469534,-0.31468479),
-    vec2<f32>(-0.16546582,0.61552503), vec2<f32>(-0.31556159,-0.60759434),
-    vec2<f32>(0.68464222,0.25003006), vec2<f32>(-0.71225601,0.29400915),
-    vec2<f32>(0.34335428,-0.73372872), vec2<f32>(0.25373051,0.80893191),
-    vec2<f32>(-0.76474605,-0.44318560), vec2<f32>(0.89713391,-0.19723274),
-    vec2<f32>(-0.54750658,0.77877246), vec2<f32>(-0.12648721,-0.97608964),
+    vec2<f32>(0.17677670,0.00000000), vec2<f32>(0.28457125,0.37117274),
+    vec2<f32>(0.25373051,0.80893191), vec2<f32>(0.68464222,0.25003006),
+    vec2<f32>(0.89713391,-0.19723274), vec2<f32>(0.49469534,-0.31468479),
+    vec2<f32>(0.03455803,-0.39377118), vec2<f32>(0.34335428,-0.73372872),
+    vec2<f32>(-0.12648721,-0.97608964), vec2<f32>(-0.31556159,-0.60759434),
+    vec2<f32>(-0.76474605,-0.44318560), vec2<f32>(-0.52222320,-0.09237387),
+    vec2<f32>(-0.22577218,0.20682583), vec2<f32>(-0.16546582,0.61552503),
+    vec2<f32>(-0.54750658,0.77877246), vec2<f32>(-0.71225601,0.29400915),
 );
 const PCSS_DISC_32:array<vec2<f32>,32>=array<vec2<f32>,32>(
-    vec2<f32>(0.12500000,0.00000000), vec2<f32>(-0.15964504,0.14624794),
-    vec2<f32>(0.02443622,-0.27843827), vec2<f32>(0.20122226,0.26245876),
-    vec2<f32>(-0.36926756,-0.06531819), vec2<f32>(0.34980243,-0.22251575),
-    vec2<f32>(-0.11700200,0.43524192), vec2<f32>(-0.22313574,-0.42963408),
-    vec2<f32>(0.48411516,0.17679795), vec2<f32>(-0.50364105,0.20789586),
-    vec2<f32>(0.24278814,-0.51882456), vec2<f32>(0.17941456,0.57200124),
-    vec2<f32>(-0.54075712,-0.31337955), vec2<f32>(0.63436947,-0.13946461),
-    vec2<f32>(-0.38714562,0.55067529), vec2<f32>(-0.08943996,-0.69019960),
-    vec2<f32>(0.54907198,0.46275800), vec2<f32>(-0.73887846,0.03055532),
-    vec2<f32>(0.53895484,-0.53633262), vec2<f32>(-0.03605775,0.77979154),
-    vec2<f32>(-0.51281790,-0.61452649), vec2<f32>(0.81235966,0.10930133),
-    vec2<f32>(-0.68831033,0.47890907), vec2<f32>(0.18808549,-0.83606151),
-    vec2<f32>(0.43503381,0.75919074), vec2<f32>(-0.85044861,-0.27131561),
-    vec2<f32>(0.82610211,-0.38168090), vec2<f32>(-0.35788752,0.85515585),
-    vec2<f32>(-0.31940807,-0.88803349), vec2<f32>(0.84990902,0.44668743),
-    vec2<f32>(-0.94403442,0.24884535), vec2<f32>(0.53659504,-0.83453027),
+    vec2<f32>(0.12500000,0.00000000), vec2<f32>(0.20122226,0.26245876),
+    vec2<f32>(0.48411516,0.17679795), vec2<f32>(0.54907198,0.46275800),
+    vec2<f32>(0.84990902,0.44668743), vec2<f32>(0.81235966,0.10930133),
+    vec2<f32>(0.63436947,-0.13946461), vec2<f32>(0.34980243,-0.22251575),
+    vec2<f32>(0.82610211,-0.38168090), vec2<f32>(0.53895484,-0.53633262),
+    vec2<f32>(0.53659504,-0.83453027), vec2<f32>(0.18808549,-0.83606151),
+    vec2<f32>(0.24278814,-0.51882456), vec2<f32>(0.02443622,-0.27843827),
+    vec2<f32>(-0.22313574,-0.42963408), vec2<f32>(-0.08943996,-0.69019960),
+    vec2<f32>(-0.31940807,-0.88803349), vec2<f32>(-0.51281790,-0.61452649),
+    vec2<f32>(-0.54075712,-0.31337955), vec2<f32>(-0.85044861,-0.27131561),
+    vec2<f32>(-0.73887846,0.03055532), vec2<f32>(-0.94403442,0.24884535),
+    vec2<f32>(-0.68831033,0.47890907), vec2<f32>(-0.50364105,0.20789586),
+    vec2<f32>(-0.36926756,-0.06531819), vec2<f32>(-0.15964504,0.14624794),
+    vec2<f32>(-0.11700200,0.43524192), vec2<f32>(-0.38714562,0.55067529),
+    vec2<f32>(-0.35788752,0.85515585), vec2<f32>(-0.03605775,0.77979154),
+    vec2<f32>(0.17941456,0.57200124), vec2<f32>(0.43503381,0.75919074),
 );
 // A pixel's turn of a layout: (cos, sin) of the angle, taken once, then
 // applied to each tap with a 2x2 rotation. Rotating a tap by the pixel's angle
@@ -211,7 +216,6 @@ fn pcss_lit(c:CascadeCoord)->f32 {
     // of the shadow's true edge. Nearer taps count more, which keeps the
     // distance estimate local to the edge in question.
     let max_texels_over_size=PCSS_MAX_TEXELS/size;
-    let search_weight_scale=1.0/f32(PCSS_SEARCH_TAPS);
     for (var i=0;i<PCSS_SEARCH_TAPS;i+=1) {
         let offset=pcss_rotate(PCSS_DISC_8[i],turn)*max_texels_over_size;
         let uv=c.uv+offset;
@@ -219,7 +223,9 @@ fn pcss_lit(c:CascadeCoord)->f32 {
         let texel_at=clamp(vec2<i32>(floor(uv*size)),vec2<i32>(0),vec2<i32>(last));
         let d=textureLoad(shadow_map,texel_at,c.cascade,0);
         if d<z {
-            let w=1.0-(f32(i)+0.5)*search_weight_scale;
+            // Squared radius of the tap from the disc's centre (see the
+            // tables' comment): nearer taps count more, in any order.
+            let w=1.0-dot(PCSS_DISC_8[i],PCSS_DISC_8[i]);
             blocker_sum+=w*d;
             weights+=w;
         }
@@ -375,14 +381,13 @@ fn combined_pcss_lit(c:CascadeCoord)->f32 {
     // edge spreads to both sides of its true edge. Nearer taps count more,
     // which keeps the distance estimate local to the edge in question.
     let max_texels_over_size=PCSS_MAX_TEXELS/size;
-    let search_weight_scale=1.0/f32(PCSS_MAP_SEARCH_TAPS);
     for (var i=0;i<PCSS_MAP_SEARCH_TAPS;i+=1) {
         let offset=pcss_rotate(PCSS_DISC_16[i],turn)*max_texels_over_size;
         let uv=c.uv+offset;
         let texel_at=clamp(vec2<i32>(floor(uv*size)),vec2<i32>(0),vec2<i32>(last));
         // Each layer is compared at its own slope-adjusted plane but measured
         // from the receiver's unadjusted depth, as each filter did alone.
-        let w=1.0-(f32(i)+0.5)*search_weight_scale;
+        let w=1.0-dot(PCSS_DISC_16[i],PCSS_DISC_16[i]);
         let d_caster=textureLoad(shadow_map,texel_at,c.cascade,0);
         let caster_here=d_caster<depth_minus_bias+dot(c.slope,offset);
         if caster_here {
@@ -465,7 +470,6 @@ fn far_map_pcss_lit(uv:vec2<f32>,depth:f32,n:vec3<f32>,layer:i32)->f32 {
     let core_blocks=core<core_z;
     var blocker_sum=pcss_sum4(select(vec4<f32>(0.0),core,core_blocks));
     var blockers=pcss_sum4(select(vec4<f32>(0.0),vec4<f32>(1.0),core_blocks));
-    let search_weight_scale=1.0/f32(PCSS_MAP_SEARCH_TAPS);
     var ring_blocked=0;
     for (var i=0;i<PCSS_MAP_SEARCH_TAPS;i+=1) {
         let offset=pcss_rotate(PCSS_DISC_16[i],turn)*(PCSS_MAX_TEXELS/size);
@@ -473,7 +477,7 @@ fn far_map_pcss_lit(uv:vec2<f32>,depth:f32,n:vec3<f32>,layer:i32)->f32 {
         let texel_at=clamp(vec2<i32>(floor((uv+offset)*size)),vec2<i32>(0),vec2<i32>(i32(size)-1));
         let d=textureLoad(shadow_map,texel_at,layer,0);
         if d<tap_z {
-            let weight=1.0-(f32(i)+0.5)*search_weight_scale;
+            let weight=1.0-dot(PCSS_DISC_16[i],PCSS_DISC_16[i]);
             blocker_sum+=weight*d;
             blockers+=weight;
             ring_blocked+=1;

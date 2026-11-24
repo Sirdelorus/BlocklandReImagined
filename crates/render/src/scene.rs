@@ -6601,6 +6601,23 @@ pub fn create_depth_samples(
 mod tests {
     use super::*;
 
+    // Catches shader edits (sun_shadows.wgsl included) that would otherwise
+    // only fail at pipeline creation when the game starts.
+    #[test]
+    fn the_scene_shaders_validate() {
+        use wgpu::naga;
+        for variant in [include_str!("scene.wgsl"), include_str!("scene_original.wgsl")] {
+            let module = naga::front::wgsl::parse_str(&super::scene_shader_source(variant))
+                .expect("parses");
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .expect("validates");
+        }
+    }
+
     #[test]
     fn a_body_keeps_the_scene_sun_under_its_room_light_or_takes_a_zones_suns() {
         let at = SceneTransform::default();
