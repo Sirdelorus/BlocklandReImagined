@@ -198,6 +198,18 @@ const RENDER_SCALE_CHOICES: [i64; 4] = [100, 85, 70, 50];
 pub fn render_scale(p: &Prefs) -> u32 {
     p.i64_or(RENDER_SCALE, 100).clamp(25, 100) as u32
 }
+/// Not a v20 setting: how the world is stretched over the window when Render
+/// Scale draws fewer pixels than it does; 0 Bilinear (the interface's own
+/// stretch), 1 FSR 3.1 (AMD's temporal reconstruction, `vendor/wgpu-ffx`).
+/// The client's graphics settings read it.
+pub const UPSCALER: &str = "$pref::Video::Upscaler";
+const UPSCALER_MENU: &str = "OptGraphicsUpscalerMenu";
+/// The menu's modes and the `$pref::Video::Upscaler` value each saves.
+const UPSCALER_CHOICES: [(&str, i64); 2] = [("Bilinear", 0), ("FSR 3.1", 1)];
+/// The upscaler `$pref::Video::Upscaler` asks for (0 Bilinear, 1 FSR).
+pub fn upscaler(p: &Prefs) -> i64 {
+    p.i64_or(UPSCALER, 0).clamp(0, 1)
+}
 /// Not a v20 setting: music bricks' volume (v20 only had Play Music).
 pub const MUSIC_VOLUME: &str = "$pref::Audio::musicVolume";
 /// Not a v20 setting: how loud other players' voices are in proximity voice
@@ -1599,6 +1611,16 @@ impl Options {
             .map(|p| (format!("{p}%"), p))
             .collect();
         s.menu(RENDER_SCALE_MENU, scale_items, scale);
+        // Every value `upscaler` can return is a choice, so no chain.
+        let upscaler = upscaler(&core.prefs);
+        s.menu(
+            UPSCALER_MENU,
+            UPSCALER_CHOICES
+                .iter()
+                .map(|&(label, value)| (label.to_string(), value))
+                .collect(),
+            upscaler,
+        );
         s.menu(
             SCREENSHOT_FORMAT_MENU,
             vec![
@@ -2197,6 +2219,7 @@ impl Options {
                     (LIGHTING_MENU, "Lighting:"),
                     (REFLECTIONS_MENU, "Reflections:"),
                     (RENDER_SCALE_MENU, "Render Scale:"),
+                    (UPSCALER_MENU, "Upscaler:"),
                     (MAX_FPS_MENU, "Max FPS:"),
                     (UI_SCALE_MENU, "UI Size:"),
                     (COLOR_VISION_MENU, "Colors:"),
@@ -2225,7 +2248,7 @@ impl Options {
                     }
                     v.add(parent, l);
                     v.add(parent, m);
-                    // Keep all seven menu rows above Done, including the
+                    // Keep all eight menu rows above Done, including the
                     // shading toggles. Two pixels still separate controls.
                     y += menu.extent[1] + 2;
                 }
@@ -2709,6 +2732,13 @@ impl Options {
         {
             self.draft
                 .set(RENDER_SCALE, scale.clamp(25, 100).to_string());
+        }
+        if let Some(mode) = self
+            .view
+            .id(UPSCALER_MENU)
+            .and_then(|n| self.view.selected(n))
+        {
+            self.draft.set(UPSCALER, mode.clamp(0, 1).to_string());
         }
         if let Some(scale) = self
             .view
@@ -4079,6 +4109,44 @@ mod tests {
         let s = Options::new(&ui.core);
         let menu = s.view.id(RENDER_SCALE_MENU).unwrap();
         assert_eq!(s.view.selected_text(menu).as_deref(), Some("60%"));
+    }
+
+    #[test]
+    fn upscaler_defaults_to_bilinear_and_saves_a_choice() {
+        let mut ui = fixture();
+        let mut s = Options::new(&ui.core);
+        let menu = s.view.id(UPSCALER_MENU).unwrap();
+        assert_eq!(s.view.selected_text(menu).as_deref(), Some("Bilinear"));
+        let items: Vec<&str> = s
+            .view
+            .node(menu)
+            .state
+            .items
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(items, ["Bilinear", "FSR 3.1"]);
+        // The row sits under Render Scale, inside Display Settings, and its
+        // label ends before the menu starts.
+        let parent = s.view.node(menu).parent.unwrap();
+        let (row, section) = (&s.view.node(menu).ctrl, &s.view.node(parent).ctrl);
+        assert!(
+            row.position[1] + row.extent[1] <= section.extent[1],
+            "{row:?} in {section:?}"
+        );
+        let scale = &s.view.node(s.view.id(RENDER_SCALE_MENU).unwrap()).ctrl;
+        assert!(row.position[1] >= scale.position[1] + scale.extent[1]);
+        // Upscaler is not part of a Quality preset.
+        let quality = s.view.id(QUALITY_MENU).unwrap();
+        s.view.select(menu, Some(1));
+        change(&mut s, &mut ui, menu);
+        assert_eq!(s.view.selected_text(quality).as_deref(), Some("High"));
+        click(&mut s, "done", &mut ui);
+        let saved = saved_prefs(&mut ui);
+        assert_eq!(upscaler(&saved), 1);
+        let s = Options::new(&ui.core);
+        let menu = s.view.id(UPSCALER_MENU).unwrap();
+        assert_eq!(s.view.selected_text(menu).as_deref(), Some("FSR 3.1"));
     }
 
     #[test]

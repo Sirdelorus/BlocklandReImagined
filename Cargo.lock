@@ -507,6 +507,7 @@ dependencies = [
  "bri-weapons",
  "bri-weather",
  "bri-world",
+ "bytemuck",
  "gilrs",
  "glam 0.33.10",
  "image",
@@ -523,6 +524,7 @@ dependencies = [
  "tracing-core",
  "ureq",
  "wgpu",
+ "wgpu-ffx",
  "windows-sys 0.61.2",
  "winit",
  "zip",
@@ -2052,6 +2054,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "num-traits",
@@ -2651,6 +2654,7 @@ dependencies = [
  "naga-types",
  "num-traits",
  "once_cell",
+ "petgraph",
  "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.21",
@@ -5551,6 +5555,23 @@ checksum = "7586165fd5f6d881cb9ce4bb71f40d6caab2c0f1837e3fc1d9788a197fb6004f"
 dependencies = [
  "wgpu-hal",
 ]
+
+[[package]]
+name = "wgpu-ffx"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "half",
+ "pollster",
+ "thiserror 2.0.21",
+ "wgpu",
+ "wgpu-ffx-shaders-spv",
+]
+
+[[package]]
+name = "wgpu-ffx-shaders-spv"
+version = "0.1.0"
 
 [[package]]
 name = "wgpu-hal"

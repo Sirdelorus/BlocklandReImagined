@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/files", "crates/chaos", "crates/crash", "crates/render", "crates/physics", "crates/content", "crates/convert", "crates/bls", "crates/world", "crates/progress", "crates/admin", "crates/identity", "crates/sim", "crates/motor", "crates/net", "crates/ui", "crates/ui-import", "crates/client", "crates/weapons", "crates/minigames", "crates/events", "crates/weapons-import", "crates/fx-runtime", "crates/fx-import", "crates/vehicles", "crates/vehicles-import", "crates/audio", "crates/audio-import", "crates/weather", "crates/weather-import", "crates/foliage", "crates/foliage-import", "crates/console", "crates/package", "crates/package-runtime", "crates/addon-import", "crates/stresslab", "crates/client-sandbox", "crates/controller", "crates/ue2-rules", "crates/emitters", "crates/effects-render", "crates/ue2-import", "crates/rendezvous", "crates/gltf"]
 resolver = "2"
-exclude = ["vendor/winit"]
+exclude = ["vendor/winit", "vendor/wgpu-ffx"]
 
 [patch.crates-io]
 winit = { path = "vendor/winit" }
@@ -30,6 +30,8 @@ tempfile = "3"
 tokio = "1"
 zip = { version = "=6.0.0", default-features = false, features = ["deflate"] }
 wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "parking_lot", "std", "vulkan", "wgsl"] }
+# FSR 3 upscaler for wgpu (vendored; Phase 0 spike per docs/plans/2026-11-24-fsr-upscaling.md).
+wgpu-ffx = { path = "vendor/wgpu-ffx/wgpu-ffx" }
 windows-sys = "0.61.2"
 zstd = "0.13"
 anyhow = "1.0"

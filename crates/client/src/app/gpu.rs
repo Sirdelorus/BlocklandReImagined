@@ -82,6 +82,13 @@ pub(super) struct GpuState {
     pub(super) upscale: Option<bri_render::upscale::Upscale>,
     /// The world's glow (`Graphics::bloom`), drawn through its own copy.
     pub(super) bloom: Option<bri_render::bloom::Bloom>,
+    /// FSR 3.1 temporal upscaling (Upscaler = Fsr at Render Scale below
+    /// 100%): AMD's compiled passes and this frame's scratch, plus the
+    /// jitter this frame's world pass applies and the camera it drew with,
+    /// which the motion-vector pass reads after the world draws.
+    pub(super) fsr: Option<super::fsr::Fsr>,
+    pub(super) fsr_jitter: Option<[f32; 2]>,
+    pub(super) fsr_camera: Option<super::fsr::FrameCamera>,
     /// The window's size this frame, which the interface (name tags) is
     /// laid out in, even while the world draws smaller.
     pub(super) display_size: (u32, u32),

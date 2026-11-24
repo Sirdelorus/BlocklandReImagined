@@ -38,6 +38,7 @@ mod addons;
 mod avatars;
 mod building;
 mod frame;
+mod fsr;
 mod fx;
 mod gpu;
 mod hud;
@@ -1933,6 +1934,9 @@ impl PlatformApp for App {
         // Made again on the new device by the next scaled frame.
         self.gpu.upscale = None;
         self.gpu.bloom = None;
+        self.gpu.fsr = None;
+        self.gpu.fsr_jitter = None;
+        self.gpu.fsr_camera = None;
         self.gpu.region_lines = Some(bri_render::lines::LineRenderer::new(
             device,
             format,
@@ -2055,6 +2059,9 @@ impl PlatformApp for App {
             shapes.clear();
         }
         self.shapes_uploaded = None;
+        self.gpu.fsr = None;
+        self.gpu.fsr_jitter = None;
+        self.gpu.fsr_camera = None;
         self.gpu.depth = None;
     }
     /// The world into the window. Below 100% Render Scale it draws into a
@@ -2063,6 +2070,31 @@ impl PlatformApp for App {
     fn render_scene(&mut self, frame: &mut RenderContext<'_>) -> Result<bool> {
         self.gpu.display_size = frame.size;
         let size = bri_render::upscale::scaled_size(frame.size, self.graphics.render_scale);
+        // FSR 3.1 reconstructs the scaled world at window size; its sub-pixel
+        // jitter is folded into this frame's camera by `render_frame`, and its
+        // passes run after the world draws below. It needs a smaller render
+        // than the window.
+        let mut fsr_wanted =
+            matches!(self.graphics.upscaler, crate::graphics::Upscaler::Fsr) && size != frame.size;
+        if fsr_wanted {
+            match self
+                .gpu
+                .fsr
+                .get_or_insert_with(|| fsr::Fsr::new(frame.device))
+                .begin_frame(frame.device, frame.queue, size, frame.size)
+            {
+                Some(jitter) => self.gpu.fsr_jitter = Some(jitter),
+                None => {
+                    // Too small for FSR's internal half-resolution textures.
+                    self.gpu.fsr = None;
+                    self.gpu.fsr_jitter = None;
+                    fsr_wanted = false;
+                }
+            }
+        } else {
+            self.gpu.fsr_jitter = None;
+            self.gpu.fsr_camera = None;
+        }
         let bloom = self.graphics.bloom.then(|| {
             self.gpu
                 .bloom
@@ -2071,8 +2103,13 @@ impl PlatformApp for App {
                 .unwrap_or_else(|| bri_render::bloom::Bloom::new(frame.device, frame.format))
         });
         if size == frame.size && bloom.is_none() {
+            // FSR never runs at every pixel: drop it so its jitter cannot
+            // leak into this direct draw.
             self.gpu.upscale = None;
             self.gpu.bloom = None;
+            self.gpu.fsr = None;
+            self.gpu.fsr_jitter = None;
+            self.gpu.fsr_camera = None;
             return self.render_frame(frame);
         }
         let mut upscale = (size != frame.size).then(|| {
@@ -2107,7 +2144,39 @@ impl PlatformApp for App {
                     None => b.draw(frame.encoder, frame.target),
                 }
             }
-            if let Some(u) = &upscale {
+            // FSR reconstructs the render scale's texture at window size; a
+            // missing camera or depth (or a failed dispatch) stretches it
+            // bilinearly instead.
+            let fsr_drew = if fsr_wanted {
+                match (&mut upscale, self.gpu.fsr_camera.take(), self.gpu.fsr.as_mut()) {
+                    (Some(u), Some(camera), Some(fsr)) => {
+                        let source = u.target(frame.device, size);
+                        // The world pass's depth must cover exactly what FSR
+                        // unprojects; a stale or missing one reads out of bounds.
+                        match self.gpu.depth.as_ref() {
+                            Some((depth, _, _))
+                                if depth.size().width == size.0 && depth.size().height == size.1 =>
+                            fsr.draw(
+                                frame.device,
+                                frame.queue,
+                                frame.encoder,
+                                source,
+                                depth,
+                                camera,
+                                frame.target,
+                                frame.format,
+                                size,
+                                frame.size,
+                            ),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !fsr_drew && let Some(u) = &upscale {
                 u.draw(frame.encoder, frame.target);
             }
         }

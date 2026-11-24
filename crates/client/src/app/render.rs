@@ -831,6 +831,25 @@ impl App {
             0.05,
             FAR_PLANE,
         );
+        // FSR's jittered camera: the same basis with AMD's sub-pixel offset
+        // folded into the projection. Its view-projection replaces the
+        // engine's, so the world pass draws shifted by at most half a pixel;
+        // `render_scene` reads it back for the motion-vector pass.
+        if let Some(jitter) = self.gpu.fsr_jitter {
+            let fsr_camera = super::fsr::FrameCamera::oriented(
+                eye,
+                forward,
+                up,
+                aspect,
+                fov,
+                0.05,
+                FAR_PLANE,
+                jitter,
+                frame.size,
+            );
+            camera.view_projection = (fsr_camera.projection * fsr_camera.view).to_cols_array();
+            self.gpu.fsr_camera = Some(fsr_camera);
+        }
         apply_environment(&mut camera);
         // The region the eye is in sets the fog (linear, the colour and distances the region names).
         let mut region_clear = None;

@@ -11,7 +11,29 @@ pub const ANTI_ALIASING: &str = "$pref::Video::AntiAliasing";
 pub const BRICK_SHADOWS: &str = "$pref::Video::BrickShadows";
 pub use bri_ui::screens::options::{
     AMBIENT_OCCLUSION, BLOOM, LIGHTING, PCSS_SUN_SHADOWS, REFLECTIONS, RENDER_SCALE, SOFT_SHADING,
+    UPSCALER,
 };
+
+/// How the world is stretched over the window when Render Scale draws fewer
+/// pixels than it does (`$pref::Video::Upscaler`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Upscaler {
+    /// The interface's own bilinear stretch.
+    Bilinear,
+    /// AMD FSR 3.1 temporal upscaling (the vendored `wgpu-ffx` port).
+    Fsr,
+}
+
+impl Upscaler {
+    /// The menu's stored value: 0 Bilinear, 1 FSR; anything else reads as
+    /// Bilinear.
+    pub fn from_pref(value: i64) -> Self {
+        match value {
+            1 => Self::Fsr,
+            _ => Self::Bilinear,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Graphics {
@@ -36,6 +58,10 @@ pub struct Graphics {
     /// of the window's width and height (100: every pixel), stretched over
     /// it; the interface always draws at full size.
     pub render_scale: u32,
+    /// Native `$pref::Video::Upscaler`: how that stretch happens below 100%
+    /// (Bilinear unless chosen; FSR 3.1 reconstructs the scaled world at
+    /// window size instead of stretching it).
+    pub upscaler: Upscaler,
     /// Native `$pref::Video::SoftShading` (on unless turned off): sky-tinted
     /// ambient in Unified and Dynamic lighting only.
     pub soft_shading: bool,
@@ -108,6 +134,7 @@ impl Graphics {
             reflections: reflection_settings(bri_ui::screens::options::reflections(&prefs)),
             lighting,
             render_scale: bri_ui::screens::options::render_scale(&prefs),
+            upscaler: Upscaler::from_pref(bri_ui::screens::options::upscaler(&prefs)),
             soft_shading: prefs.bool_or(SOFT_SHADING, true),
             ambient_occlusion: prefs.bool_or(AMBIENT_OCCLUSION, true),
             bloom: prefs.bool_or(BLOOM, true),
@@ -164,6 +191,11 @@ mod tests {
         assert_eq!(graphics(&[(RENDER_SCALE, "70")]).render_scale, 70);
         assert_eq!(graphics(&[(RENDER_SCALE, "5")]).render_scale, 25);
         assert_eq!(graphics(&[(RENDER_SCALE, "400")]).render_scale, 100);
+        // Upscaler: the bilinear stretch unless FSR is chosen; out-of-range
+        // values clamp like the other video settings.
+        assert_eq!(graphics(&[]).upscaler, Upscaler::Bilinear);
+        assert_eq!(graphics(&[(UPSCALER, "1")]).upscaler, Upscaler::Fsr);
+        assert_eq!(graphics(&[(UPSCALER, "7")]).upscaler, Upscaler::Fsr);
         assert!(!graphics(&[]).brick_shadows);
         assert!(graphics(&[(BRICK_SHADOWS, "1")]).brick_shadows);
         assert_eq!(graphics(&[]).shadows, Some(ShadowSettings::BEST));

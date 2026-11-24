@@ -42,6 +42,7 @@ winit = "0.30"
 tracing-core = { version = "0.1", default-features = false, features = ["std"] }
 gilrs = "0.11"
 wgpu.workspace = true
+bytemuck.workspace = true
 pollster.workspace = true
 image = { workspace = true, features = ["jpeg"] }
 sha2.workspace = true
@@ -55,6 +56,10 @@ bri-weather = { path = "../weather" }
 
 bri-foliage = { path = "../foliage" }
 bri-client-sandbox = { path = "../client-sandbox" }
+# FSR 3.1 temporal upscaling (docs/plans/2026-11-24-fsr-upscaling.md): the
+# vendored wgpu port of AMD's FidelityFX Super Resolution 3, behind the
+# Upscaler graphics option.
+wgpu-ffx.workspace = true
 
 # Clipboard: on Linux, wayland-data-control reads/writes the native Wayland
 # clipboard (wl-clipboard-rs); arboard falls back to X11 otherwise. Without

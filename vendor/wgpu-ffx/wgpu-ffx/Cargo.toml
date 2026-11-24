@@ -1,0 +1,20 @@
+[package]
+name = "wgpu-ffx"
+version = "0.1.0"
+edition = "2024"
+authors = ["wgpu-ffx developers", "Advanced Micro Devices, Inc."]
+license = "MIT"
+repository = "https://github.com/cwfitzgerald/wgpu-ffx"
+description = "AMD FidelityFX FSR 3 Upscaler for wgpu (vendored; see ../BRI-PATCH.md)"
+
+[dependencies]
+bitflags = "2"
+bytemuck = { version = "1.14", features = ["derive"] }
+half = { version = "2.7", features = ["bytemuck"] }
+thiserror = "2"
+# Pinned to the workspace's wgpu so one copy of wgpu serves both; upstream
+# asked for 29 (see ../BRI-PATCH.md).
+wgpu = { version = "=30.0.1", default-features = false, features = ["spirv", "wgsl"] }
+wgpu-ffx-shaders-spv = { path = "../wgpu-ffx-shaders-spv", version = "0.1.0" }
+
+pollster = "0.4"
