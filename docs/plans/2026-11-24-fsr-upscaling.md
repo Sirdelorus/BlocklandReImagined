@@ -223,7 +223,7 @@ FSR is implemented **on top of the vendored [wgpu-ffx](https://github.com/cwfitz
 - **Ghosting of moving objects is expected** in v1 — motion vectors are camera-only; per-object MVs are Phase 2.
 - Watch for disocclusion artifacts near the 0.05 near plane and general brightness sanity (exposure pass output).
 - **If everything trails in a consistent direction when the camera moves, the MV sign convention is suspect** — flip `px_prev − px_curr` to its negation in `fsr.rs` and re-test before chasing anything else.
-- Then run the GPU-dependent `bri-client` test suite on that machine (it fails by design headless here) and do the Phase 3 A/B capture: same map/seed, camera pan plus a moving object, bilinear vs FSR.
+- Then run the GPU-dependent `bri-client` tests on that machine (they fail by design headless where VRAM is occupied): at minimum `cargo test -p bri-client --lib fsr_upscaler_reconstructs_the_scaled_world_at_window_size` — a smoke test that hosts synthetic content, draws full/bilinear/FSR frames at 50% scale and checks the FSR context survives, the output is a plausible world distinct from bilinear, and toggling back and forth keeps drawing — plus its neighbor `render_scale_draws_the_world_smaller_and_fills_the_window` (the bilinear path it replaced), then the wider suite. Finally do the Phase 3 A/B capture: same map/seed, camera pan plus a moving object, bilinear vs FSR.
 
 ### Remaining work (Phase 2+)
 
