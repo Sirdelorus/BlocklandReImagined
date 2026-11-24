@@ -636,6 +636,11 @@ fn map_light_total(position:vec3<f32>,n:vec3<f32>,visibility:MapVisibility)->vec
 // casters and the map layer as object_sun takes, with no visibility volume -
 // past the bounded cascade range it fades to unshadowed, never old masks.
 fn dynamic_sun(position:vec3<f32>,normal:vec3<f32>)->f32 {
+    // A face turned from the sun gets no direct light, and its sun share only
+    // tints its ambient: it takes the plain filters (scene_sun_unlit_face).
+    let n=normal/max(length(normal),0.0001);
+    let toward=-camera.sun_direction.xyz/max(length(camera.sun_direction.xyz),0.0001);
+    if dot(n,toward)<=0.0 {return scene_sun_unlit_face(position,normal,1.0);}
     return scene_sun(position,normal,1.0);
 }
 // Descriptors plus current geometry cubes: no legacy visibility input exists
