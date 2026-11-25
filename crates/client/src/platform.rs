@@ -139,9 +139,30 @@ fn request_device(
         ..Default::default()
     }))
     .context("no compatible adapter")?;
-    // Timestamps, where the GPU has them, time Add-On code's layers.
+    // Timestamps, where the GPU has them, time Add-On code's layers. FSR 3.1
+    // also needs read-write 32-bit float storage textures (SPD mips, frame
+    // info), which wgpu's static WebGPU-guaranteed format table does not grant
+    // combined read-write storage for — only R32Float gets it there — so ask
+    // the device to validate formats against the driver's real capabilities,
+    // 16-bit norm texture support for its Lanczos LUT (R16Snorm; core on every
+    // conformant Vulkan driver), and CLEAR_TEXTURE: the crate clears its SPD
+    // mips with CommandEncoder::clear_texture every frame, which wgpu gates
+    // behind that feature (Vulkan grants it unconditionally).
+    let required_features = bri_client_sandbox::gpu::timing_features(&adapter)
+        | adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        | adapter.features() & wgpu::Features::CLEAR_TEXTURE;
+    // FSR 3.1's luma pyramid pass binds eight storage textures in one compute
+    // bind group, but wgpu's default limit is four; request whatever this
+    // adapter supports (never more than that) so the passes can be built on any
+    // GPU and weak ones still create the device.
+    let required_limits = wgpu::Limits {
+        max_storage_textures_per_shader_stage: adapter.limits().max_storage_textures_per_shader_stage,
+        ..Default::default()
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: bri_client_sandbox::gpu::timing_features(&adapter),
+        required_features,
+        required_limits,
         ..Default::default()
     }))
     .context("creating the GPU device")?;

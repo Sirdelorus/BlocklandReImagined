@@ -2074,8 +2074,18 @@ impl PlatformApp for App {
         // jitter is folded into this frame's camera by `render_frame`, and its
         // passes run after the world draws below. It needs a smaller render
         // than the window.
-        let mut fsr_wanted =
-            matches!(self.graphics.upscaler, crate::graphics::Upscaler::Fsr) && size != frame.size;
+        let mut fsr_wanted = matches!(self.graphics.upscaler, crate::graphics::Upscaler::Fsr)
+            && size != frame.size
+            // FSR's luma pyramid binds eight storage textures in one compute bind
+            // group; a GPU with fewer cannot build the pass (wgpu would panic), so
+            // fall back to bilinear like every other FSR miss. Its Lanczos LUT is an
+            // R16Snorm texture, which needs the 16-bit norm feature too, and its
+            // per-frame SPD mip clear uses CommandEncoder::clear_texture, which
+            // needs CLEAR_TEXTURE (Vulkan always has it; other backends may not).
+            && frame.device.limits().max_storage_textures_per_shader_stage
+                >= fsr::MIN_STORAGE_TEXTURES_PER_STAGE
+            && frame.device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+            && frame.device.features().contains(wgpu::Features::CLEAR_TEXTURE);
         if fsr_wanted {
             match self
                 .gpu

@@ -15,9 +15,10 @@
 //!    camera, reprojects it through the previous frame's, and stores the
 //!    screen-space delta — exact for camera motion over static geometry;
 //!    moving objects ghost until per-object MVs arrive (Phase 2 of the plan).
-//! 4. `FsrContext::dispatch` runs AMD's temporal passes into an Rgba16Float
-//!    output at the window's size, and `blit` copies it back to the window
-//!    view as-is.
+//! 4. `FsrContext::dispatch` runs AMD's temporal passes into an Rgba32Float
+//!    output at the window's size (FSR writes it as a storage image, and no
+//!    GPU exposes 16-bit float formats for that), and `blit` copies it back
+//!    to the window view as-is.
 //!
 //! History resets whenever `gpu.fsr` is dropped (device loss, map change) or
 //! the sizes move (`begin_frame` reallocates); a discontinuous camera jump
@@ -174,6 +175,12 @@ pub(super) fn view_position_from_depth(
     ) * reversed_depth_distance(d, near, far)
 }
 
+/// Storage textures per compute stage FSR 3.1 needs: its luma pyramid pass
+/// binds FrameInfo, six SPD mips and FarthestDepthMip1 in one bind group.
+/// A GPU with fewer cannot build that layout (wgpu would panic), so
+/// `render_scene` falls back to bilinear on such devices.
+pub(super) const MIN_STORAGE_TEXTURES_PER_STAGE: u32 = 8;
+
 /// The FSR 3.1 upscaler for the current device: AMD's compiled passes plus
 /// this frame's scratch textures and temporal state. Created lazily on the
 /// first scaled frame with Upscaler = FSR; dropped by `gpu_ready`/
@@ -259,48 +266,51 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
         vec2(3.0, -1.0),
         vec2(-1.0, 3.0),
     );
-    return VsOut { pos: vec4(p[i], 0.0, 1.0) };
+    return VsOut(vec4(p[i], 0.0, 1.0));
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 
 @fragment
-fn fs_convert(@builtin(position) pos: vec4<f32>) {
+fn fs_convert(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return textureLoad(src, vec2<u32>(pos.xy), 0);
 }
 
 @group(0) @binding(0) var src_out: texture_2d<f32>;
 
 @fragment
-fn fs_blit(@builtin(position) pos: vec4<f32>) {
+fn fs_blit(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return textureLoad(src_out, vec2<u32>(pos.xy), 0);
 }
 "#;
 
 const DEPTH_COPY_SINGLE_WGSL: &str = r#"
 @group(0) @binding(0) var src_depth: texture_depth_2d;
-@group(0) @binding(1) var out: texture_storage_2d<rgba32f, write>;
+@group(0) @binding(1) var out: texture_storage_2d<r32float, write>;
 
-// The world-pass depth (single-sample) into FSR's R32Float input.
+// The world-pass depth (single-sample) into FSR's R32Float input. A depth
+// load is a scalar f32; the store takes a vec4 of which only the .r lands.
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = textureDimensions(out);
     if id.x >= dims.x || id.y >= dims.y { return; }
-    let d = textureLoad(src_depth, vec2(id.x, id.y), 0).r;
+    let d = textureLoad(src_depth, vec2(id.x, id.y), 0);
     textureStore(out, vec2(id.x, id.y), vec4(d));
 }
 "#;
 
 const DEPTH_COPY_MSAA_WGSL: &str = r#"
-@group(0) @binding(0) var src_depth: texture_multisample_depth_2d;
-@group(0) @binding(1) var out: texture_storage_2d<rgba32f, write>;
+@group(0) @binding(0) var src_depth: texture_depth_multisampled_2d;
+@group(0) @binding(1) var out: texture_storage_2d<r32float, write>;
 
-// The world-pass depth (MSAA): sample 0 is what the colour resolve used.
+// The world-pass depth (MSAA): sample 0 is what the colour resolve used. A
+// depth load is a scalar f32; the store takes a vec4 of which only the .r
+// lands.
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = textureDimensions(out);
     if id.x >= dims.x || id.y >= dims.y { return; }
-    let d = textureLoad(src_depth, vec2(id.x, id.y), 0).r;
+    let d = textureLoad(src_depth, vec2(id.x, id.y), 0);
     textureStore(out, vec2(id.x, id.y), vec4(d));
 }
 "#;
@@ -324,7 +334,10 @@ struct MvUniforms {
 
 @group(0) @binding(0) var<uniform> u: MvUniforms;
 @group(0) @binding(1) var depth: texture_2d<f32>;
-@group(0) @binding(2) var mv_out: texture_storage_2d<rg16f, write>;
+// rg32float (not rg16f): NVIDIA exposes no 16-bit float formats for
+// storage images. WGSL's textureStore always takes a vec4; only the .xy lands
+// in this RG image, which is what FSR reads.
+@group(0) @binding(2) var mv_out: texture_storage_2d<rg32float, write>;
 
 fn unproject(ndc: vec2<f32>, d: f32) -> vec3<f32> {
     // Reversed-Z (1 near, 0 far): dist = n*f / (d*(f-n)+n), the same as FSR's
@@ -353,7 +366,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if clip.w <= 0.0 {
         // Behind the previous eye: no valid reprojection. Zero reads as "no
         // motion"; FSR's depth checks treat it as a disocclusion.
-        textureStore(mv_out, vec2(id.x, id.y), vec2<f32>(0.0));
+        textureStore(mv_out, vec2(id.x, id.y), vec4<f32>(0.0));
         return;
     }
     let ndc_prev = clip.xy / clip.w;
@@ -361,7 +374,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         (ndc_prev.x + 1.0) * 0.5 * u.size.x,
         (1.0 - ndc_prev.y) * 0.5 * u.size.y,
     );
-    textureStore(mv_out, vec2(id.x, id.y), px_prev - (px + 0.5));
+    textureStore(mv_out, vec2(id.x, id.y), vec4(px_prev - (px + 0.5), 0.0, 0.0));
 }
 
 // The first frame after a reset has no previous camera: store zero motion and
@@ -370,7 +383,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 fn main_clear(@builtin(global_invocation_id) id: vec3<u32>) {
     let dims = textureDimensions(mv_out);
     if id.x >= dims.x || id.y >= dims.y { return; }
-    textureStore(mv_out, vec2(id.x, id.y), vec2<f32>(0.0));
+    textureStore(mv_out, vec2(id.x, id.y), vec4<f32>(0.0));
 }
 "#;
 
@@ -500,7 +513,9 @@ impl Fsr {
                     },
                     count: None,
                 },
-                storage_entry(2, wgpu::TextureFormat::Rg16Float),
+                // Rg32Float to match MV_WGSL's storage image (NVIDIA has no
+                // 16-bit float storage).
+                storage_entry(2, wgpu::TextureFormat::Rg32Float),
             ],
         });
         // The clear variant binds the same three entries, so both pipelines
@@ -751,7 +766,7 @@ impl Fsr {
             pass.dispatch_workgroups(render_size.0.div_ceil(8), render_size.1.div_ceil(8), 1);
         }
 
-        // 4. AMD's temporal passes into the f16 output at window size.
+        // 4. AMD's temporal passes into the f32 output at window size.
         let dt = self.frame_dt_ms.unwrap_or(16.7).clamped(1.0, 250.0);
         let info = FsrDispatchInfo {
             color: self.input_color.clone(),
@@ -790,7 +805,7 @@ impl Fsr {
             return false;
         }
 
-        // 5. The f16 output back to the window view (identity copy).
+        // 5. The f32 output back to the window view (identity copy).
         let blit_pipeline = self.blit_pipelines.entry(window_format).or_insert_with(|| {
             fullscreen_pipeline(
                 device,
@@ -866,10 +881,12 @@ impl Fsr {
             wgpu::TextureFormat::R32Float,
             wgpu::TextureUsages::STORAGE_BINDING | read,
         );
+        // Rg32Float: written by the MV compute pass as a storage image (NVIDIA
+        // exposes no 16-bit float formats for that) and sampled by FSR.
         self.motion_vectors = tex(
             "fsr motion vectors",
             render_size,
-            wgpu::TextureFormat::Rg16Float,
+            wgpu::TextureFormat::Rg32Float,
             wgpu::TextureUsages::STORAGE_BINDING | read,
         );
         // FSR's dilated outputs and reconstructed previous depth: the crate
@@ -880,10 +897,11 @@ impl Fsr {
             wgpu::TextureFormat::R32Float,
             wgpu::TextureUsages::STORAGE_BINDING | read,
         );
+        // Rg32Float: FSR's prepare inputs writes it as a storage image.
         self.dilated_motion_vectors = tex(
             "fsr dilated motion vectors",
             render_size,
-            wgpu::TextureFormat::Rg16Float,
+            wgpu::TextureFormat::Rg32Float,
             wgpu::TextureUsages::STORAGE_BINDING | read,
         );
         let bytes = u64::from(render_size.0 * render_size.1) * 4;
@@ -893,10 +911,13 @@ impl Fsr {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Rgba32Float: FSR's accumulate writes it as a storage image; the blit
+        // samples it back. (The input stays Rgba16Float — it is only attached
+        // and sampled, never stored.)
         self.output = tex(
             "fsr output",
             upscale_size,
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
             wgpu::TextureUsages::STORAGE_BINDING | read,
         );
     }
@@ -921,12 +942,17 @@ fn placeholder_texture(device: &wgpu::Device, label: &str) -> wgpu::Texture {
     })
 }
 
+// The source entry for `fsr convert` and `fsr blit`. Both fragment shaders
+// use only textureLoad (exact texel fetches, no sampler), so filtering is not
+// required — declaring the entry non-filterable also lets the blit read FSR's
+// Rgba32Float output, whose views are non-filterable on drivers without
+// FLOAT32_FILTERABLE (NVIDIA).
 fn src_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },

@@ -281,6 +281,21 @@ FfxUInt32x2 SPD_RenderSize()
 layout(set = 0, binding = FSR3UPSCALER_BIND_SAMPLER_POINT_CLAMP) uniform sampler s_PointClamp;
 layout(set = 0, binding = FSR3UPSCALER_BIND_SAMPLER_LINEAR_CLAMP) uniform sampler s_LinearClamp;
 
+// BRI-PATCH (Ninth): AMD's original routes every "Sample*" helper through
+// s_LinearClamp. Conformant Vulkan exposes no linear filtering for the
+// 32-bit float formats FSR stores its internal signals in — R32F/RG32F/
+// RGBA32F carry no SAMPLED_IMAGE_FILTER_LINEAR guarantee in the spec's format
+// table, and wgpu marks those views non-filterable unless the device
+// advertises FLOAT32_FILTERABLE (NVIDIA does not) — so each helper below that
+// samples one of those textures now uses s_PointClamp instead. Every call site
+// passes an explicit LOD to textureLod, so point sampling is exact; it only
+// drops bilinear smoothing within a level, and only on internal analysis
+// signals (masks, weights, history) — never on the final color path. The
+// genuinely filterable formats keep linear sampling: the R8Unorm masks,
+// the Rgba16Float input color, and the R16Snorm Lanczos LUT (RCAS weight
+// quality depends on it). If an application supplies reactive or
+// transparency/composition masks, use a filterable format such as R8Unorm.
+
 #if defined(FSR3UPSCALER_BIND_SRV_SPD_MIPS)
 layout(set = 0, binding = FSR3UPSCALER_BIND_SRV_SPD_MIPS) uniform texture2D r_spd_mips;
 
@@ -291,7 +306,8 @@ FfxInt32x2 GetSPDMipDimensions(FfxUInt32 uMipLevel)
 
 FfxFloat32x2 SampleSPDMipLevel(FfxFloat32x2 fUV, FfxUInt32 mipLevel)
 {
-    return textureLod(sampler2D(r_spd_mips, s_LinearClamp), fUV, float(mipLevel)).rg;
+    // BRI-PATCH (Ninth): point sampling — r_spd_mips is Rg32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_spd_mips, s_PointClamp), fUV, float(mipLevel)).rg;
 }
 #endif
 
@@ -305,7 +321,8 @@ FfxFloat32 LoadInputDepth(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleInputDepth(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_input_depth, s_LinearClamp), fUV, 0.0).x;
+    // BRI-PATCH (Ninth): point sampling — r_input_depth is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_input_depth, s_PointClamp), fUV, 0.0).x;
 }
 #endif
 
@@ -388,12 +405,13 @@ FfxFloat32x4 LoadHistory(FfxInt32x2 iPxHistory)
 
 FfxFloat32x4 SampleHistory(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_internal_upscaled_color, s_LinearClamp), fUV, 0.0);
+    // BRI-PATCH (Ninth): point sampling — r_internal_upscaled_color is Rgba32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_internal_upscaled_color, s_PointClamp), fUV, 0.0);
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_LUMA_HISTORY)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba16f) uniform image2D rw_luma_history;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba32f) uniform image2D rw_luma_history;
 
 void StoreLumaHistory(FfxInt32x2 iPxPos, FfxFloat32x4 fLumaHistory)
 {
@@ -411,7 +429,8 @@ FfxFloat32x4 LoadLumaHistory(FfxInt32x2 iPxPos)
 
 FfxFloat32x4 SampleLumaHistory(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_luma_history, s_LinearClamp), fUV, 0.0);
+    // BRI-PATCH (Ninth): point sampling — r_luma_history is Rgba32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_luma_history, s_PointClamp), fUV, 0.0);
 }
 #endif
 
@@ -425,12 +444,13 @@ FfxFloat32x4 LoadRCAS_Input(FfxInt32x2 iPxPos)
 
 FfxFloat32x3 SampleRCAS_Input(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_rcas_input, s_LinearClamp), fUV, 0.0).rgb;
+    // BRI-PATCH (Ninth): point sampling — r_rcas_input is Rgba32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_rcas_input, s_PointClamp), fUV, 0.0).rgb;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_INTERNAL_UPSCALED)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_INTERNAL_UPSCALED, rgba16f) writeonly uniform image2D rw_internal_upscaled_color;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_INTERNAL_UPSCALED, rgba32f) writeonly uniform image2D rw_internal_upscaled_color;
 
 void StoreReprojectedHistory(FfxInt32x2 iPxHistory, FfxFloat32x4 fHistory)
 {
@@ -444,7 +464,7 @@ void StoreInternalColorAndWeight(FfxInt32x2 iPxPos, FfxFloat32x4 fColorAndWeight
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_UPSCALED_OUTPUT)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_UPSCALED_OUTPUT, rgba16f) writeonly uniform image2D rw_upscaled_output;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_UPSCALED_OUTPUT, rgba32f) writeonly uniform image2D rw_upscaled_output;
 
 void StoreUpscaledOutput(FfxInt32x2 iPxPos, FfxFloat32x3 fColor)
 {
@@ -457,12 +477,13 @@ layout(set = 0, binding = FSR3UPSCALER_BIND_SRV_ACCUMULATION) uniform texture2D 
 
 FfxFloat32 SampleAccumulation(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_accumulation, s_LinearClamp), fUV, 0.0).x;
+    // BRI-PATCH (Ninth): point sampling — r_accumulation is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_accumulation, s_PointClamp), fUV, 0.0).x;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_ACCUMULATION)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_ACCUMULATION, r8) uniform image2D rw_accumulation;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_ACCUMULATION, r32f) uniform image2D rw_accumulation;
 
 void StoreAccumulation(FfxInt32x2 iPxPos, FfxFloat32 fAccumulation)
 {
@@ -480,12 +501,13 @@ FfxFloat32 LoadShadingChange(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleShadingChange(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_shading_change, s_LinearClamp), fUV, 0.0).x * cbConstants.FSR3Upscaler.fShadingChangeScale;
+    // BRI-PATCH (Ninth): point sampling — r_shading_change is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_shading_change, s_PointClamp), fUV, 0.0).x * cbConstants.FSR3Upscaler.fShadingChangeScale;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_SHADING_CHANGE)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SHADING_CHANGE, r8) uniform image2D rw_shading_change;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SHADING_CHANGE, r32f) uniform image2D rw_shading_change;
 
 void StoreShadingChange(FfxInt32x2 iPxPos, FfxFloat32 fShadingChange)
 {
@@ -508,12 +530,13 @@ FfxFloat32 LoadFarthestDepth(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleFarthestDepth(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_farthest_depth, s_LinearClamp), fUV, 0.0).x;
+    // BRI-PATCH (Ninth): point sampling — r_farthest_depth is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_farthest_depth, s_PointClamp), fUV, 0.0).x;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH, r16f) uniform image2D rw_farthest_depth;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH, r32f) uniform image2D rw_farthest_depth;
 
 void StoreFarthestDepth(FfxInt32x2 iPxPos, FfxFloat32 fDepth)
 {
@@ -536,12 +559,13 @@ FfxFloat32 LoadFarthestDepthMip1(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleFarthestDepthMip1(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_farthest_depth_mip1, s_LinearClamp), fUV, 0.0).x;
+    // BRI-PATCH (Ninth): point sampling — r_farthest_depth_mip1 is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_farthest_depth_mip1, s_PointClamp), fUV, 0.0).x;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH_MIP1)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH_MIP1, r16f) uniform image2D rw_farthest_depth_mip1;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_FARTHEST_DEPTH_MIP1, r32f) uniform image2D rw_farthest_depth_mip1;
 
 void StoreFarthestDepthMip1(FfxInt32x2 iPxPos, FfxFloat32 fDepth)
 {
@@ -559,12 +583,13 @@ FfxFloat32 LoadCurrentLuma(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleCurrentLuma(FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_current_luma, s_LinearClamp), uv, 0.0).r;
+    // BRI-PATCH (Ninth): point sampling — r_current_luma is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_current_luma, s_PointClamp), uv, 0.0).r;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_CURRENT_LUMA)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_CURRENT_LUMA, r16f) uniform image2D rw_current_luma;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_CURRENT_LUMA, r32f) uniform image2D rw_current_luma;
 
 void StoreCurrentLuma(FfxInt32x2 iPxPos, FfxFloat32 fLuma)
 {
@@ -577,12 +602,13 @@ layout(set = 0, binding = FSR3UPSCALER_BIND_SRV_LUMA_INSTABILITY) uniform textur
 
 FfxFloat32 SampleLumaInstability(FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_luma_instability, s_LinearClamp), uv, 0.0).x;
+    // BRI-PATCH (Ninth): point sampling — r_luma_instability is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_luma_instability, s_PointClamp), uv, 0.0).x;
 }
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_LUMA_INSTABILITY)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_INSTABILITY, r16f) uniform image2D rw_luma_instability;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_INSTABILITY, r32f) uniform image2D rw_luma_instability;
 
 void StoreLumaInstability(FfxInt32x2 iPxPos, FfxFloat32 fLumaInstability)
 {
@@ -600,7 +626,8 @@ FfxFloat32 LoadPreviousLuma(FfxInt32x2 iPxPos)
 
 FfxFloat32 SamplePreviousLuma(FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_previous_luma, s_LinearClamp), uv, 0.0).r;
+    // BRI-PATCH (Ninth): point sampling — r_previous_luma is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_previous_luma, s_PointClamp), uv, 0.0).r;
 }
 #endif
 
@@ -614,7 +641,7 @@ FfxFloat32 LoadNewLocks(FfxInt32x2 iPxPos)
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_NEW_LOCKS)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_NEW_LOCKS, r8) uniform image2D rw_new_locks;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_NEW_LOCKS, r32f) uniform image2D rw_new_locks;
 
 FfxFloat32 LoadRwNewLocks(FfxInt32x2 iPxPos)
 {
@@ -673,7 +700,7 @@ void StoreDilatedDepth(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxF
 #endif
 
 #if defined(FSR3UPSCALER_BIND_UAV_DILATED_MOTION_VECTORS)
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_DILATED_MOTION_VECTORS, rg16f) writeonly uniform image2D rw_dilated_motion_vectors;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_DILATED_MOTION_VECTORS, rg32f) writeonly uniform image2D rw_dilated_motion_vectors;
 
 void StoreDilatedMotionVector(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32x2 fMotionVector)
 {
@@ -691,7 +718,8 @@ FfxFloat32x2 LoadDilatedMotionVector(FfxInt32x2 iPxInput)
 
 FfxFloat32x2 SampleDilatedMotionVector(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_dilated_motion_vectors, s_LinearClamp), fUV, 0.0).xy;
+    // BRI-PATCH (Ninth): point sampling — r_dilated_motion_vectors is Rg32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_dilated_motion_vectors, s_PointClamp), fUV, 0.0).xy;
 }
 #endif
 
@@ -705,7 +733,8 @@ FfxFloat32 LoadDilatedDepth(FfxInt32x2 iPxInput)
 
 FfxFloat32 SampleDilatedDepth(FfxFloat32x2 fUV)
 {
-    return textureLod(sampler2D(r_dilated_depth, s_LinearClamp), fUV, 0.0).r;
+    // BRI-PATCH (Ninth): point sampling — r_dilated_depth is R32Float (non-filterable on conformant Vulkan).
+    return textureLod(sampler2D(r_dilated_depth, s_PointClamp), fUV, 0.0).r;
 }
 #endif
 
@@ -847,12 +876,12 @@ FfxFloat32x4 FrameInfo()
     defined(FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_4) && \
     defined(FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_5)
 
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_0, rg16f) uniform image2D rw_spd_mip0;
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_1, rg16f) uniform image2D rw_spd_mip1;
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_2, rg16f) uniform image2D rw_spd_mip2;
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_3, rg16f) uniform image2D rw_spd_mip3;
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_4, rg16f) uniform image2D rw_spd_mip4;
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_5, rg16f) coherent uniform image2D rw_spd_mip5;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_0, rg32f) uniform image2D rw_spd_mip0;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_1, rg32f) uniform image2D rw_spd_mip1;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_2, rg32f) uniform image2D rw_spd_mip2;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_3, rg32f) uniform image2D rw_spd_mip3;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_4, rg32f) uniform image2D rw_spd_mip4;
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_5, rg32f) uniform image2D rw_spd_mip5;
 
 FfxFloat32x2 RWLoadPyramid(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxUInt32 index)
 {
@@ -893,7 +922,7 @@ void StorePyramid(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat3
 #endif
 
 #if defined FSR3UPSCALER_BIND_UAV_SPD_GLOBAL_ATOMIC
-layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_GLOBAL_ATOMIC) coherent buffer RwSpdGlobalAtomic
+layout(set = 0, binding = FSR3UPSCALER_BIND_UAV_SPD_GLOBAL_ATOMIC) buffer RwSpdGlobalAtomic
 {
     FfxUInt32 rw_spd_global_atomic;
 };

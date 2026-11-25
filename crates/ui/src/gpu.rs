@@ -875,9 +875,31 @@ impl Headless {
                 .await
                 .context("no wgpu adapter")?;
             let adapter_info = adapter.get_info();
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default())
-                .await?;
+            // FSR 3.1's read-write 32-bit float storage textures are not in
+            // wgpu's static WebGPU-guaranteed format table, so validate formats
+            // against the driver's real capabilities (the same request platform.rs
+            // makes for the game device), and its Lanczos LUT needs 16-bit norm
+            // texture support (R16Snorm). Its luma pyramid pass also binds eight
+            // storage textures in one compute bind group while wgpu's default
+            // limit is four, so request whatever this adapter supports — never
+            // more than that, which keeps weak GPUs able to create the device.
+            // CLEAR_TEXTURE too: the crate clears its SPD mips with
+            // CommandEncoder::clear_texture every frame (Vulkan grants the
+            // feature unconditionally).
+            let descriptor = wgpu::DeviceDescriptor {
+                required_features: (adapter.features()
+                    & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+                    | (adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+                    | (adapter.features() & wgpu::Features::CLEAR_TEXTURE),
+                required_limits: wgpu::Limits {
+                    max_storage_textures_per_shader_stage: adapter
+                        .limits()
+                        .max_storage_textures_per_shader_stage,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (device, queue) = adapter.request_device(&descriptor).await?;
             Ok(Headless {
                 device,
                 queue,

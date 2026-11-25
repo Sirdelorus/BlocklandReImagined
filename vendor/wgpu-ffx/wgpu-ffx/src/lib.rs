@@ -790,23 +790,23 @@ impl FsrView {
         // Constant buffer
         total += mem::size_of::<constants::Constants>() as u64;
 
-        // accumulation_1 + accumulation_2: R8Unorm at render size
-        total += render_pixels * 2;
-        // luma_1 + luma_2: R16Float at render size
-        total += render_pixels * 2 * 2;
-        // intermediate_fp16x1: R16Float at render size
-        total += render_pixels * 2;
-        // luma_history1 + luma_history2: Rgba16Float at render size
-        total += render_pixels * 8 * 2;
+        // accumulation_1 + accumulation_2: R32Float at render size (BRI-PATCH)
+        total += render_pixels * 4 * 2;
+        // luma_1 + luma_2: R32Float at render size (BRI-PATCH)
+        total += render_pixels * 4 * 2;
+        // intermediate_fp16x1: R32Float at render size (BRI-PATCH)
+        total += render_pixels * 4;
+        // luma_history1 + luma_history2: Rgba32Float at render size (BRI-PATCH)
+        total += render_pixels * 16 * 2;
         // dilated_reactive_masks: Rgba8Unorm at render size
         total += render_pixels * 4;
 
-        // shading_change: R8Unorm at half render size
-        total += half_render_pixels;
-        // farthest_depth_mip1: R16Float at half render size
-        total += half_render_pixels * 2;
+        // shading_change: R32Float at half render size (BRI-PATCH)
+        total += half_render_pixels * 4;
+        // farthest_depth_mip1: R32Float at half render size (BRI-PATCH)
+        total += half_render_pixels * 4;
 
-        // spd_mips: Rg16Float with mip chain at half render size
+        // spd_mips: Rg32Float with mip chain at half render size (BRI-PATCH)
         let half_render_extent = wgpu::Extent3d {
             width: hrw,
             height: hrh,
@@ -816,15 +816,15 @@ impl FsrView {
         let mut mip_w = hrw;
         let mut mip_h = hrh;
         for _ in 0..mip_count {
-            total += mip_w as u64 * mip_h as u64 * 4; // Rg16Float = 4 bytes
+            total += mip_w as u64 * mip_h as u64 * 8; // Rg32Float = 8 bytes
             mip_w = (mip_w / 2).max(1);
             mip_h = (mip_h / 2).max(1);
         }
 
-        // new_locks: R8Unorm at upscale size
-        total += upscale_pixels;
-        // internal_upscaled_1 + internal_upscaled_2: Rgba16Float at upscale size
-        total += upscale_pixels * 8 * 2;
+        // new_locks: R32Float at upscale size (BRI-PATCH)
+        total += upscale_pixels * 4;
+        // internal_upscaled_1 + internal_upscaled_2: Rgba32Float at upscale size (BRI-PATCH)
+        total += upscale_pixels * 16 * 2;
 
         // Fixed-size textures
         total += 128 * 2; // lanczos2_lut: 128 entries × R16Snorm (2 bytes)
@@ -888,7 +888,7 @@ pub struct FsrDispatchInfo {
     pub transparency_and_composition: Option<wgpu::Texture>,
     /// A Texture with format `R32Float` at render resolution, with `STORAGE_BINDING` and `TEXTURE_BINDING` usage. Used to emit dilated depth and share with following effects.
     pub dilated_depth: wgpu::Texture,
-    /// A Texture with format `Rg16Float` at render resolution, with `STORAGE_BINDING` and `TEXTURE_BINDING` usage. Used to emit dilated motion vectors and share with following effects.
+    /// A Texture with format `Rg32Float` at render resolution, with `STORAGE_BINDING` and `TEXTURE_BINDING` usage. Used to emit dilated motion vectors and share with following effects.
     pub dilated_motion_vectors: wgpu::Texture,
     /// A Buffer of size `render_width * render_height * 4` bytes, with `STORAGE` and `COPY_DST` usage. Used to emit reconstructed previous nearest depth and share with following effects.
     pub reconstructed_previous_depth: wgpu::Buffer,
@@ -1052,7 +1052,7 @@ fn fsr_dispatch_smoke() {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rg16Float,
+        format: wgpu::TextureFormat::Rg32Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1074,6 +1074,7 @@ fn fsr_dispatch_smoke() {
     });
 
     let dilated_motion_vectors = device.create_texture(&wgpu::TextureDescriptor {
+        // BRI-PATCH: Rg32Float — FSR's prepare inputs writes it as a storage image.
         label: Some("test_dilated_motion_vectors"),
         size: wgpu::Extent3d {
             width: render_size[0],
@@ -1083,12 +1084,13 @@ fn fsr_dispatch_smoke() {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rg16Float,
+        format: wgpu::TextureFormat::Rg32Float,
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
 
     let output = device.create_texture(&wgpu::TextureDescriptor {
+        // BRI-PATCH: Rgba32Float — FSR's accumulate writes it as a storage image.
         label: Some("test_output"),
         size: wgpu::Extent3d {
             width: upscale_size[0],
@@ -1098,7 +1100,7 @@ fn fsr_dispatch_smoke() {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
+        format: wgpu::TextureFormat::Rgba32Float,
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
