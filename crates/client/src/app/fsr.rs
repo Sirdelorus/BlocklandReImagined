@@ -193,6 +193,9 @@ pub(super) struct Fsr {
     view: Option<wgpu_ffx::FsrView>,
     jitter_index: i32,
     phase_count: i32,
+    /// This cycle's Halton phases in nearest-neighbour order (rebuilt when
+    /// `phase_count` changes); see `nearest_neighbor_jitter_tour`.
+    jitter_tour: Vec<[f32; 2]>,
     /// This frame's offset (render-resolution pixels): applied to the world
     /// pass by `begin_frame`'s caller and passed to `dispatch`.
     current_jitter: [f32; 2],
@@ -387,6 +390,52 @@ fn main_clear(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// This cycle's Halton phases visited in an order that keeps each frame-to-
+/// frame sub-pixel jump small (greedy nearest-neighbour over the phase set).
+///
+/// Why not AMD's plain index order: on Vulkan every one of FSR's 32-bit float
+/// history textures is point-sampled (core Vulkan exposes no filterable f32
+/// formats), so a jitter delta between consecutive frames shifts those reads
+/// to different integer texels even for perfectly still content. The shading-
+/// change, luma-instability and reactivity passes then flicker sub-pixel
+/// every frame — the "heat shimmer" at a still camera. Visiting all phases
+/// once per cycle keeps TAA's sample coverage identical; only their order
+/// changes, shrinking the typical delta from ~0.25-0.5 px to well under 0.1.
+fn nearest_neighbor_jitter_tour(phase_count: i32) -> Vec<[f32; 2]> {
+    let phases: Vec<[f32; 2]> = (0..phase_count).map(|i| get_jitter_offset(i, phase_count)).collect();
+    let n = phases.len();
+    if n <= 1 {
+        return phases;
+    }
+    let mut used = vec![false; n];
+    let mut tour = Vec::with_capacity(n);
+    let mut current = 0usize;
+    for step in 0..n {
+        used[current] = true;
+        tour.push(phases[current]);
+        if step + 1 == n {
+            break; // the cycle is complete
+        }
+        let from = phases[current];
+        let mut best: Option<usize> = None;
+        let mut best_d2 = f32::INFINITY;
+        for (i, phase) in phases.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let dx = phase[0] - from[0];
+            let dy = phase[1] - from[1];
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = Some(i);
+            }
+        }
+        current = best.expect("every step before the last has an unused phase");
+    }
+    tour
+}
+
 impl Fsr {
     /// Compiles AMD's passes (a one-time hitch on first enable) and the
     /// engine-side pipelines. Scratch resources follow in `begin_frame`.
@@ -534,6 +583,7 @@ impl Fsr {
             view: None,
             jitter_index: 0,
             phase_count: 0,
+            jitter_tour: Vec::new(),
             current_jitter: [0.0; 2],
             frame_dt_ms: None,
             last_begin: None,
@@ -616,9 +666,11 @@ impl Fsr {
         }
         let phase_count = get_jitter_phase_count(render_size.0 as i32, upscale_size.0 as i32).max(1);
         if phase_count != self.phase_count {
-            // A new sequence length restarts the Halton index at its head.
+            // A new sequence length restarts the cycle at its head and
+            // reorders the phases for small frame-to-frame jumps.
             self.phase_count = phase_count;
             self.jitter_index = 0;
+            self.jitter_tour = nearest_neighbor_jitter_tour(phase_count);
         }
         let now = Instant::now();
         self.frame_dt_ms = Some(
@@ -627,7 +679,7 @@ impl Fsr {
                 .unwrap_or(16.7),
         );
         self.last_begin = Some(now);
-        self.current_jitter = get_jitter_offset(self.jitter_index, phase_count);
+        self.current_jitter = self.jitter_tour[self.jitter_index as usize];
         self.jitter_index = (self.jitter_index + 1).rem_euclid(phase_count);
         Some(self.current_jitter)
     }
@@ -1176,6 +1228,50 @@ mod tests {
             let fsr = e / (d - c);
             assert!((fsr - t).abs() < t * 1e-2 + 1e-3, "fsr: t {t} -> {fsr}");
         }
+    }
+
+    /// The tour visits every Halton phase exactly once per cycle, so TAA's
+    /// sample coverage is identical to AMD's plain index order.
+    #[test]
+    fn the_jitter_tour_visits_every_phase_once() {
+        for phase_count in [1, 2, 8, 32, 64] {
+            let tour = nearest_neighbor_jitter_tour(phase_count);
+            assert_eq!(tour.len(), phase_count as usize);
+            let mut plain: Vec<[f32; 2]> =
+                (0..phase_count).map(|i| get_jitter_offset(i, phase_count)).collect();
+            let mut ordered = tour;
+            let by_phase = |a: &[f32; 2], b: &[f32; 2]| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1]));
+            plain.sort_by(by_phase);
+            ordered.sort_by(by_phase);
+            assert_eq!(plain, ordered, "phase_count {phase_count}");
+        }
+    }
+
+    /// The tour's total path length (including the cycle wrap) is shorter than
+    /// AMD's plain Halton order — that is what shrinks the per-frame jitter
+    /// delta FSR's point-sampled history reads quantize.
+    #[test]
+    fn the_jitter_tour_keeps_consecutive_jumps_small() {
+        let phase_count = 32;
+        let plain: Vec<[f32; 2]> = (0..phase_count).map(|i| get_jitter_offset(i, phase_count)).collect();
+        let tour = nearest_neighbor_jitter_tour(phase_count);
+        let path_len = |seq: &[[f32; 2]]| {
+            let mut total = 0.0f32;
+            for w in seq.windows(2) {
+                total += (w[0][0] - w[1][0]).abs() + (w[0][1] - w[1][1]).abs();
+            }
+            // The cycle wraps back to its first phase.
+            let last = seq.last().expect("a tour of 32 phases is non-empty");
+            let first = seq.first().expect("a tour of 32 phases is non-empty");
+            total += (last[0] - first[0]).abs() + (last[1] - first[1]).abs();
+            total
+        };
+        assert!(
+            path_len(&tour) < path_len(&plain),
+            "tour {} >= plain {}",
+            path_len(&tour),
+            path_len(&plain)
+        );
     }
 
     /// A teleport or a sharp turn resets history; walking does not.
