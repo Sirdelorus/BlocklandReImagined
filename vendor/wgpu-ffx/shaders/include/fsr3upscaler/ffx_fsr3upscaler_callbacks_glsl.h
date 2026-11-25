@@ -296,6 +296,41 @@ layout(set = 0, binding = FSR3UPSCALER_BIND_SAMPLER_LINEAR_CLAMP) uniform sample
 // quality depends on it). If an application supplies reactive or
 // transparency/composition masks, use a filterable format such as R8Unorm.
 
+// BRI-PATCH (Eleventh): AMD's original routes the "Sample*" helpers below
+// through s_LinearClamp — hardware bilinear. The Ninth patch replaced that
+// with point sampling for conformance, which is exact at texel centers but
+// quantizes any sub-pixel UV shift to the nearest integer texel. Several call
+// sites feed a jitter-shifted (or motion-reprojected) UV into those helpers;
+// on a perfectly still scene the ideal sample position moves by the per-frame
+// jitter delta, so point sampling flips between two neighbouring texels
+// frame-to-frame and the shading-change / luma-instability / reactivity
+// signals flicker sub-pixel — visible as "heat shimmer" at a stationary
+// camera. This restores AMD's bilinear semantics manually: four exact
+// texelFetches mixed by the fractional offset, clamped to the image border
+// like the original clamp sampler. The fetches stay on non-filterable formats
+// (conformant); no filtering sampler is involved. At an exact texel center
+// (fraction 0) this returns exactly the old point-sampled value, so call sites
+// without sub-pixel shifts are unchanged.
+struct FfxBilinearCoords
+{
+    FfxInt32x2 iBase; // lower-left texel of the 4-tap window, clamped to [0, size-1]
+    FfxFloat32x2 fFrac; // fractional offset within that window, in [0, 1)
+};
+
+FfxBilinearCoords FfxBilinearResolve(texture2D tex, FfxUInt32 mipLevel, FfxFloat32x2 fUV)
+{
+    const FfxInt32x2 iSize = textureSize(tex, int(mipLevel)).xy;
+    const FfxFloat32x2 fPx = fUV * FfxFloat32x2(iSize);
+    const FfxInt32x2 iBase = clamp(FfxInt32x2(floor(fPx - 0.5f)), FfxInt32x2(0), iSize - FfxInt32x2(1));
+    // clamp (not saturate): desktop GLSL for Vulkan has no saturate builtin.
+    return FfxBilinearCoords(iBase, clamp(fPx - FfxFloat32x2(iBase) - 0.5f, FfxFloat32x2(0.0), FfxFloat32x2(1.0)));
+}
+
+FfxInt32x2 FfxBilinearNeighbor(FfxBilinearCoords c, FfxInt32x2 iOffset, FfxInt32x2 iMax)
+{
+    return min(c.iBase + iOffset, iMax);
+}
+
 #if defined(FSR3UPSCALER_BIND_SRV_SPD_MIPS)
 layout(set = 0, binding = FSR3UPSCALER_BIND_SRV_SPD_MIPS) uniform texture2D r_spd_mips;
 
@@ -306,8 +341,12 @@ FfxInt32x2 GetSPDMipDimensions(FfxUInt32 uMipLevel)
 
 FfxFloat32x2 SampleSPDMipLevel(FfxFloat32x2 fUV, FfxUInt32 mipLevel)
 {
-    // BRI-PATCH (Ninth): point sampling — r_spd_mips is Rg32Float (non-filterable on conformant Vulkan).
-    return textureLod(sampler2D(r_spd_mips, s_PointClamp), fUV, float(mipLevel)).rg;
+    // BRI-PATCH (Eleventh): manual bilinear at the requested mip — r_spd_mips is Rg32Float, non-filterable on conformant Vulkan; AMD's original linear-samples this.
+    const FfxBilinearCoords c = FfxBilinearResolve(r_spd_mips, mipLevel, fUV);
+    const FfxInt32x2 iMax = textureSize(r_spd_mips, int(mipLevel)).xy - FfxInt32x2(1);
+    return mix(mix(texelFetch(r_spd_mips, c.iBase, int(mipLevel)).rg, texelFetch(r_spd_mips, FfxBilinearNeighbor(c, FfxInt32x2(1, 0), iMax), int(mipLevel)).rg, c.fFrac.x),
+               mix(texelFetch(r_spd_mips, FfxBilinearNeighbor(c, FfxInt32x2(0, 1), iMax), int(mipLevel)).rg, texelFetch(r_spd_mips, FfxBilinearNeighbor(c, FfxInt32x2(1, 1), iMax), int(mipLevel)).rg, c.fFrac.x),
+               c.fFrac.y);
 }
 #endif
 
@@ -429,8 +468,12 @@ FfxFloat32x4 LoadLumaHistory(FfxInt32x2 iPxPos)
 
 FfxFloat32x4 SampleLumaHistory(FfxFloat32x2 fUV)
 {
-    // BRI-PATCH (Ninth): point sampling — r_luma_history is Rgba32Float (non-filterable on conformant Vulkan).
-    return textureLod(sampler2D(r_luma_history, s_PointClamp), fUV, 0.0);
+    // BRI-PATCH (Eleventh): manual bilinear — r_luma_history is Rgba32Float, non-filterable on conformant Vulkan; AMD's original linear-samples this.
+    const FfxBilinearCoords c = FfxBilinearResolve(r_luma_history, 0u, fUV);
+    const FfxInt32x2 iMax = textureSize(r_luma_history, 0).xy - FfxInt32x2(1);
+    return mix(mix(texelFetch(r_luma_history, c.iBase, 0), texelFetch(r_luma_history, FfxBilinearNeighbor(c, FfxInt32x2(1, 0), iMax), 0), c.fFrac.x),
+               mix(texelFetch(r_luma_history, FfxBilinearNeighbor(c, FfxInt32x2(0, 1), iMax), 0), texelFetch(r_luma_history, FfxBilinearNeighbor(c, FfxInt32x2(1, 1), iMax), 0), c.fFrac.x),
+               c.fFrac.y);
 }
 #endif
 
@@ -501,8 +544,12 @@ FfxFloat32 LoadShadingChange(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleShadingChange(FfxFloat32x2 fUV)
 {
-    // BRI-PATCH (Ninth): point sampling — r_shading_change is R32Float (non-filterable on conformant Vulkan).
-    return textureLod(sampler2D(r_shading_change, s_PointClamp), fUV, 0.0).x * cbConstants.FSR3Upscaler.fShadingChangeScale;
+    // BRI-PATCH (Eleventh): manual bilinear — r_shading_change is R32Float, non-filterable on conformant Vulkan; AMD's original linear-samples this.
+    const FfxBilinearCoords c = FfxBilinearResolve(r_shading_change, 0u, fUV);
+    const FfxInt32x2 iMax = textureSize(r_shading_change, 0).xy - FfxInt32x2(1);
+    return mix(mix(texelFetch(r_shading_change, c.iBase, 0).x, texelFetch(r_shading_change, FfxBilinearNeighbor(c, FfxInt32x2(1, 0), iMax), 0).x, c.fFrac.x),
+               mix(texelFetch(r_shading_change, FfxBilinearNeighbor(c, FfxInt32x2(0, 1), iMax), 0).x, texelFetch(r_shading_change, FfxBilinearNeighbor(c, FfxInt32x2(1, 1), iMax), 0).x, c.fFrac.x),
+               c.fFrac.y) * cbConstants.FSR3Upscaler.fShadingChangeScale;
 }
 #endif
 
@@ -559,8 +606,12 @@ FfxFloat32 LoadFarthestDepthMip1(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleFarthestDepthMip1(FfxFloat32x2 fUV)
 {
-    // BRI-PATCH (Ninth): point sampling — r_farthest_depth_mip1 is R32Float (non-filterable on conformant Vulkan).
-    return textureLod(sampler2D(r_farthest_depth_mip1, s_PointClamp), fUV, 0.0).x;
+    // BRI-PATCH (Eleventh): manual bilinear — r_farthest_depth_mip1 is R32Float, non-filterable on conformant Vulkan; AMD's original linear-samples this.
+    const FfxBilinearCoords c = FfxBilinearResolve(r_farthest_depth_mip1, 0u, fUV);
+    const FfxInt32x2 iMax = textureSize(r_farthest_depth_mip1, 0).xy - FfxInt32x2(1);
+    return mix(mix(texelFetch(r_farthest_depth_mip1, c.iBase, 0).x, texelFetch(r_farthest_depth_mip1, FfxBilinearNeighbor(c, FfxInt32x2(1, 0), iMax), 0).x, c.fFrac.x),
+               mix(texelFetch(r_farthest_depth_mip1, FfxBilinearNeighbor(c, FfxInt32x2(0, 1), iMax), 0).x, texelFetch(r_farthest_depth_mip1, FfxBilinearNeighbor(c, FfxInt32x2(1, 1), iMax), 0).x, c.fFrac.x),
+               c.fFrac.y);
 }
 #endif
 
@@ -583,8 +634,12 @@ FfxFloat32 LoadCurrentLuma(FfxInt32x2 iPxPos)
 
 FfxFloat32 SampleCurrentLuma(FfxFloat32x2 uv)
 {
-    // BRI-PATCH (Ninth): point sampling — r_current_luma is R32Float (non-filterable on conformant Vulkan).
-    return textureLod(sampler2D(r_current_luma, s_PointClamp), uv, 0.0).r;
+    // BRI-PATCH (Eleventh): manual bilinear — r_current_luma is R32Float, non-filterable on conformant Vulkan; AMD's original linear-samples this.
+    const FfxBilinearCoords c = FfxBilinearResolve(r_current_luma, 0u, uv);
+    const FfxInt32x2 iMax = textureSize(r_current_luma, 0).xy - FfxInt32x2(1);
+    return mix(mix(texelFetch(r_current_luma, c.iBase, 0).r, texelFetch(r_current_luma, FfxBilinearNeighbor(c, FfxInt32x2(1, 0), iMax), 0).r, c.fFrac.x),
+               mix(texelFetch(r_current_luma, FfxBilinearNeighbor(c, FfxInt32x2(0, 1), iMax), 0).r, texelFetch(r_current_luma, FfxBilinearNeighbor(c, FfxInt32x2(1, 1), iMax), 0).r, c.fFrac.x),
+               c.fFrac.y);
 }
 #endif
 

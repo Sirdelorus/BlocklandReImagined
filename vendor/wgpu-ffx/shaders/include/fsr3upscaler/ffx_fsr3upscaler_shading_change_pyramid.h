@@ -118,16 +118,39 @@ FfxFloat32 ComputeMinimumDifference(FfxInt32x2 iPxPos, SampleSet fSet0, SampleSe
     return fMinDiff * FfxFloat32(fMinDiff < (FSR3UPSCALER_FP16_MAX - 1));
 }
 
+// BRI-PATCH (Eleventh): AMD's original evaluates these 5-tap crosses through a
+// linear sampler on the luma pyramids. After the Ninth patch those reads were
+// point-sampled, which quantizes the jitter-shifted base position to an integer
+// texel; for a perfectly still scene the ideal position moves by the per-frame
+// jitter delta and the whole cross flips between two neighbouring texels every
+// frame, so the shading-change signal flickers ("heat shimmer"). This restores
+// bilinear semantics with exact texelFetches: the base stays continuous (the
+// +Jitter term cancels the luma buffer's own jitter shift, so a still scene
+// lands on identical world points in current and previous frames) and each tap
+// is a 4-tap bilinear at base+offset, clamped to the border like the original
+// clamp sampler. No filtering sampler is involved (conformant core Vulkan).
+FfxFloat32 SpdBilinearLumaTap(texture2D tex, FfxFloat32x2 fPxPos)
+{
+    const FfxInt32x2   iMax  = textureSize(tex, 0).xy - FfxInt32x2(1);
+    const FfxInt32x2   iBase = clamp(FfxInt32x2(floor(fPxPos - 0.5f)), FfxInt32x2(0), iMax);
+    const FfxFloat32x2 fFrac = clamp(fPxPos - FfxFloat32x2(iBase) - 0.5f, FfxFloat32x2(0.0), FfxFloat32x2(1.0)); // clamp (not saturate): desktop GLSL for Vulkan has no saturate builtin
+
+    return mix(mix(texelFetch(tex, iBase, 0).r, texelFetch(tex, min(iBase + FfxInt32x2(1, 0), iMax), 0).r, fFrac.x),
+               mix(texelFetch(tex, min(iBase + FfxInt32x2(0, 1), iMax), 0).r, texelFetch(tex, min(iBase + FfxInt32x2(1, 1), iMax), 0).r, fFrac.x),
+               fFrac.y);
+}
+
 SampleSet GetCurrentLumaBilinearSamples(FfxFloat32x2 fUv)
 {
     const FfxFloat32x2 fUvJittered = fUv + Jitter() / RenderSize();
-    const FfxInt32x2   iBasePos    = FfxInt32x2(floor(fUvJittered * RenderSize()));
+    // BRI-PATCH (Eleventh): continuous base position in texel units; each tap below is bilinear.
+    const FfxFloat32x2 fBasePx     = fUvJittered * RenderSize();
 
     SampleSet fSet;
 
     for (FfxInt32 iSampleIndex = 0; iSampleIndex < SHADING_CHANGE_SET_SIZE; iSampleIndex++) {
-        const FfxInt32x2 iSamplePos = ClampLoad(iBasePos, iSampleOffsets[iSampleIndex], RenderSize());
-        fSet.fSamples[iSampleIndex] = LoadCurrentLuma(iSamplePos) * Exposure();
+        const FfxFloat32x2 fSamplePx = fBasePx + FfxFloat32x2(iSampleOffsets[iSampleIndex]);
+        fSet.fSamples[iSampleIndex] = SpdBilinearLumaTap(r_current_luma, fSamplePx) * Exposure();
         fSet.fSamples[iSampleIndex] = ffxPow(fSet.fSamples[iSampleIndex], fShadingChangeSamplePow);
         fSet.fSamples[iSampleIndex] = ffxMax(fSet.fSamples[iSampleIndex], FSR3UPSCALER_EPSILON);
     }
@@ -152,12 +175,13 @@ PreviousLumaBilinearSamplesData GetPreviousLumaBilinearSamples(FfxFloat32x2 fUv,
 
     if (data.bIsExistingSample) {
 
-        const FfxInt32x2 iBasePos = FfxInt32x2(floor(fReprojectedUv * PreviousFrameRenderSize()));
+        // BRI-PATCH (Eleventh): continuous base position in texel units; each tap below is bilinear.
+        const FfxFloat32x2 fBasePx = fReprojectedUv * PreviousFrameRenderSize();
 
         for (FfxInt32 iSampleIndex = 0; iSampleIndex < SHADING_CHANGE_SET_SIZE; iSampleIndex++) {
 
-            const FfxInt32x2 iSamplePos = ClampLoad(iBasePos, iSampleOffsets[iSampleIndex], PreviousFrameRenderSize());
-            data.fSet.fSamples[iSampleIndex] = LoadPreviousLuma(iSamplePos) * DeltaPreExposure() * Exposure();
+            const FfxFloat32x2 fSamplePx = fBasePx + FfxFloat32x2(iSampleOffsets[iSampleIndex]);
+            data.fSet.fSamples[iSampleIndex] = SpdBilinearLumaTap(r_previous_luma, fSamplePx) * DeltaPreExposure() * Exposure();
             data.fSet.fSamples[iSampleIndex] = ffxPow(data.fSet.fSamples[iSampleIndex], fShadingChangeSamplePow);
             data.fSet.fSamples[iSampleIndex] = ffxMax(data.fSet.fSamples[iSampleIndex], FSR3UPSCALER_EPSILON);
         }
