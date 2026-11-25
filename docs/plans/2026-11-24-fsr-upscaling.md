@@ -281,3 +281,43 @@ holds ~22 GiB of VRAM and the GPU tests need it.
 ### Remaining work (Phase 2+)
 
 Per-object motion vectors (plan Phase 2); RCAS sharpening is off in v1 (`enable_sharpening = false`); the reactive mask pass if playtests show HUD/text shimmer at aggressive scales.
+
+## 2026-11-25: FSR 3.1 "heat shimmer" at still camera
+
+**Symptom (user playtest):** with FSR 3.1 selected, aliasing wobbles like heat haze even when the camera is perfectly still; bilinear upscale looks fine.
+
+### Root cause
+
+The engine's MV contract and the crate's jitter cancellation are correct: for a still scene the stored MV is exactly `(j_prev − j_curr)` px and FSR cancels it to zero, so colour reprojection is stable. The shimmer comes from every *other* temporal read that adds a jitter-shifted UV but samples a **non-filterable 32-bit float texture** — core Vulkan exposes no filterable f32 formats:
+
+- the shading-change pyramid's 5-tap crosses (`GetCurrentLumaBilinearSamples` / `GetPreviousLumaBilinearSamples`, `floor(uv*size)` + integer texelFetch) in `ffx_fsr3upscaler_shading_change_pyramid.h`;
+- the luma-instability history read into point-sampled `r_luma_history` in `ffx_fsr3upscaler_luma_instability.h`;
+- dilated-reactive-mask / farthest-depth-mip1 samples (point-sampled R32F) in accumulate & prepare_reactivity;
+- the BRI-PATCH Ninth point-sampling sites in `ffx_fsr3upscaler_callbacks_glsl.h`.
+
+Each read lands on an integer texel whose *content* differs frame-to-frame by exactly the jitter delta — which changes every Halton step even for perfectly still content. Shading change has no threshold (any nonzero luma diff decays accumulation), so reactivity/accumulation weights flicker sub-pixel every frame and the temporal filter keeps restarting → heat shimmer. In AMD's D3D12 reference these textures are filterable (R32F is filterable there) so the shifts cancel smoothly; the artifact is specific to Vulkan point sampling. No engine-side MV trick can fix it: the needed correction is fractional and varies per frame, which integer-indexed reads cannot track.
+
+### Mitigation implemented 2026-11-25 (uncommitted)
+
+`crates/client/src/app/fsr.rs`: `nearest_neighbor_jitter_tour(phase_count)` — a greedy nearest-neighbour ordering of all Halton phases; `Fsr::begin_frame` now reads the current jitter from this tour instead of plain index order. Per-frame jitter delta shrinks from ~0.25–0.5 px to well under 0.1 px typical, while full-cycle TAA coverage stays identical (every phase visited once). Two new CPU unit tests cover tour properties; all `app::fsr` pure-math tests pass. **This is a mitigation, not a cure** — the quantization error at point-sampled reads remains, just smaller.
+
+### Definitive fix implemented 2026-11-25 (uncommitted, awaiting playtest confirmation)
+
+GLSL surgery as planned — manual 4-tap bilinear at the jitter-shifted read sites: exact `texelFetch`es mixed by the fractional offset, clamped to the border like AMD's clamp sampler. No filtering sampler is involved, so conformance and the Ninth/Tenth patches' sample-type declarations are unchanged; at an exact texel centre this returns exactly the old point-sampled value.
+
+- **Converted (jitter-shifted / reprojected UV sites):** five "Sample*" helpers in `ffx_fsr3upscaler_callbacks_glsl.h` — `SampleSPDMipLevel`, `SampleShadingChange`, `SampleFarthestDepthMip1`, `SampleCurrentLuma`, `SampleLumaHistory` — via new shared infrastructure (`FfxBilinearCoords` / `FfxBilinearResolve` / `FfxBilinearNeighbor`); and the shading-change pyramid's two 5-tap crosses in `ffx_fsr3upscaler_shading_change_pyramid.h`, which now keep a *continuous* base position (the +Jitter term cancels the luma buffer's own jitter shift, so a still scene lands on identical world points in current and previous frames) with each tap bilinear at base+offset. A deliberate deviation from AMD's reference, which floors these crosses.
+- **Deliberately left point-sampled** (verified stable for still scenes — no jitter term or exact integer positions): `SampleAccumulation`, `SampleLumaInstability`, the dilated MV/depth reads, and the exact-position `LoadCurrentLuma` users (`ComputeThinFeatureConfidence`, luma pyramid source load).
+- 28 `.spv` files rebuilt in place (accumulate ×24 permutation variants + one each of luma_instability, prepare_reactivity, shading_change, shading_change_pyramid); the other 12 byte-identical; all 40 pass spirv-val. Rebuild/regression tooling is now in-tree: `vendor/wgpu-ffx/shaders/rebuild_spv.py` (`--dry-run` byte-compares every committed `.spv` against a fresh compile — one command shows an edit's blast radius).
+- Gotcha found on first compile: desktop GLSL for Vulkan has no `saturate` builtin (ESSL-only) — the infrastructure uses `clamp(x, 0.0, 1.0)`.
+
+Verified CPU-side: cargo check/clippy clean, spirv-val 40/40, dry-run shows exactly the expected 28 files changed and nothing else, all `app::fsr` pure-math tests pass. **Awaiting playtest:** FSR on/off at 50% scale with a still camera — shimmer should be gone or near-gone; also check motion handling for regressions (the crosses are bilinear where AMD's reference floors them). If shimmer persists: remaining candidates are bilinearizing the rest of patch-nine's point-sampled helpers (`SampleAccumulation`, `SampleLumaInstability`, dilated MV/depth UV reads), or a DittoSR port as a second upscaler option.
+
+### Playtest 2026-11-25 (after the GLSL fix): shimmer persists; name tags implicated
+
+The user's playtest of the rebuilt release binary (verified to contain the new SPIR-V) found the world shimmer **unchanged**, plus a new clue: player name tags jitter too, "for some reason" — they're UI.
+
+**Name-tag root cause (engine-side, two parts):** `name_tags()` projected labels through FSR's *jittered* view-projection (`render_frame` replaces `camera.view_projection` before anything else runs), and its NDC offset is amplified by the upscale ratio when mapped to window pixels — up to ~1-2 px of wobble at 50% scale. And like all UI, tags draw into the render-scale buffer *before* upscaling, so FSR temporally filters them like scene content (thin high-frequency text being exactly what temporal filters struggle with).
+
+**Fix applied:** `render_frame` now captures `ui_view_projection` before FSR replaces the camera's and passes it to `name_tags()`, making label positions temporally stable so the filter can lock onto them. The proper fix — drawing name tags *after* upscaling at window resolution, crisp text never entering temporal history (standard practice: BeamNG, the Bloodborne/Uncharted ports all composite HUD post-upscale) — is a follow-up; bri-ui's `Ui::render` already takes an arbitrary target + DrawList, so a post-FSR name-tag pass is feasible.
+
+**Research on the residual world shimmer:** it matches documented FSR 3.1 behavior rather than a port delta now that our sampling matches AMD's reference semantics — Digital Foundry's FSR 3.1 review calls sub-pixel flicker "inherent to FSR" and notes it persists in 3.1 (reduced vs 3.0); [AMD SDK issue #134](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/issues/134) reports "a constant shimmering on almost every edge with FSR3 as if the algorithm is unable to converge, this does not happen with FSR2" against AMD's *own* Unreal plugin; [OptiScaler #55](https://github.com/optiscaler/OptiScaler/issues/55) sees excessive shimmer in shipped games (Cyberpunk 2077, Alan Wake 2). Our content — flat colours and hard edges on every surface — is the worst case for edge convergence. Options: accept it with bilinear as the stable fallback; trade render scale against aliasing load; port **FSR 2** as an alternative upscaler option (better temporal stability per those reports; wgpu-ffx ships FSR 3 only); or DittoSR later (user's suggestion).

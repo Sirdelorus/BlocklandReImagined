@@ -831,6 +831,11 @@ impl App {
             0.05,
             FAR_PLANE,
         );
+        // Screen-space labels (name tags) keep projecting with this
+        // un-jittered view-projection: FSR's per-frame sub-pixel camera shift
+        // would wobble them, and its NDC offset is amplified by the upscale
+        // ratio when mapped to window pixels.
+        let ui_view_projection = glam::Mat4::from_cols_array(&camera.view_projection);
         // FSR's jittered camera: the same basis with AMD's sub-pixel offset
         // folded into the projection. Its view-projection replaces the
         // engine's, so the world pass draws shifted by at most half a pixel;
@@ -1461,7 +1466,7 @@ impl App {
             &self.vehicle_assets,
             &self.content.weapons.pack,
             self.build.building.as_ref(),
-            glam::Mat4::from_cols_array(&camera.view_projection),
+            ui_view_projection,
             eye,
             (fog_start.max(0.), fog_end.max(1.)),
             // The interface's window, not the world's smaller Render Scale.
