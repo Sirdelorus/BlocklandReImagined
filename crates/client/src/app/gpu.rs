@@ -89,6 +89,9 @@ pub(super) struct GpuState {
     pub(super) fsr: Option<super::fsr::Fsr>,
     pub(super) fsr_jitter: Option<[f32; 2]>,
     pub(super) fsr_camera: Option<super::fsr::FrameCamera>,
+    /// NVIDIA Image Scaling (Upscaler = Nis at Render Scale below 100%): one
+    /// spatial pass over the render scale's texture; no jitter or history.
+    pub(super) nis: Option<super::nis::Nis>,
     /// The window's size this frame, which the interface (name tags) is
     /// laid out in, even while the world draws smaller.
     pub(super) display_size: (u32, u32),

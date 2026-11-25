@@ -188,6 +188,7 @@ impl App {
                 fsr: None,
                 fsr_jitter: None,
                 fsr_camera: None,
+                nis: None,
                 display_size: (1, 1),
             },
             audio,

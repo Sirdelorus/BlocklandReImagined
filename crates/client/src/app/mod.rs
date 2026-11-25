@@ -47,6 +47,7 @@ mod load;
 mod lobby;
 pub(crate) mod mounts;
 mod net_events;
+mod nis;
 mod perf;
 mod probes;
 mod render;
@@ -1937,6 +1938,7 @@ impl PlatformApp for App {
         self.gpu.fsr = None;
         self.gpu.fsr_jitter = None;
         self.gpu.fsr_camera = None;
+        self.gpu.nis = None;
         self.gpu.region_lines = Some(bri_render::lines::LineRenderer::new(
             device,
             format,
@@ -2062,6 +2064,7 @@ impl PlatformApp for App {
         self.gpu.fsr = None;
         self.gpu.fsr_jitter = None;
         self.gpu.fsr_camera = None;
+        self.gpu.nis = None;
         self.gpu.depth = None;
     }
     /// The world into the window. Below 100% Render Scale it draws into a
@@ -2105,6 +2108,13 @@ impl PlatformApp for App {
             self.gpu.fsr_jitter = None;
             self.gpu.fsr_camera = None;
         }
+        // NVIDIA Image Scaling reconstructs the scaled world at window size
+        // with one spatial pass (no jitter or history to reset); it only
+        // scales from 50%..=100%, so below its range the plain stretch stands
+        // in.
+        let nis_wanted = matches!(self.graphics.upscaler, crate::graphics::Upscaler::Nis)
+            && size != frame.size
+            && self.graphics.render_scale >= nis::MIN_RENDER_SCALE;
         let bloom = self.graphics.bloom.then(|| {
             self.gpu
                 .bloom
@@ -2186,7 +2196,37 @@ impl PlatformApp for App {
             } else {
                 false
             };
-            if !fsr_drew && let Some(u) = &upscale {
+            // NIS reconstructs it with one spatial pass; a refused scale
+            // stretches it bilinearly instead.
+            let nis_drew = if !fsr_drew && nis_wanted {
+                match &mut upscale {
+                    Some(u) => {
+                        let mut nis = self
+                            .gpu
+                            .nis
+                            .take()
+                            .filter(|n| n.format() == frame.format)
+                            .unwrap_or_else(|| {
+                                nis::Nis::new(frame.device, frame.queue, frame.format)
+                            });
+                        let drew = nis.draw(
+                            frame.device,
+                            frame.queue,
+                            frame.encoder,
+                            u.target(frame.device, size),
+                            frame.target,
+                            size,
+                            frame.size,
+                        );
+                        self.gpu.nis = Some(nis);
+                        drew
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !fsr_drew && !nis_drew && let Some(u) = &upscale {
                 u.draw(frame.encoder, frame.target);
             }
         }

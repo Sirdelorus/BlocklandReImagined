@@ -29,7 +29,8 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 zip = { version = "=6.0.0", default-features = false, features = ["deflate"] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "parking_lot", "std", "vulkan", "wgsl"] }
+# `spirv`: the vendored NVIDIA Image Scaling pass ships precompiled SPIR-V.
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "parking_lot", "std", "spirv", "vulkan", "wgsl"] }
 # FSR 3 upscaler for wgpu (vendored; Phase 0 spike per docs/plans/2026-11-24-fsr-upscaling.md).
 wgpu-ffx = { path = "vendor/wgpu-ffx/wgpu-ffx" }
 windows-sys = "0.61.2"

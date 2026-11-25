@@ -22,14 +22,18 @@ pub enum Upscaler {
     Bilinear,
     /// AMD FSR 3.1 temporal upscaling (the vendored `wgpu-ffx` port).
     Fsr,
+    /// NVIDIA Image Scaling: a spatial, edge-aware scale with no temporal
+    /// state (the vendored `nvidia-image-scaling` SDK's NVScaler pass).
+    Nis,
 }
 
 impl Upscaler {
-    /// The menu's stored value: 0 Bilinear, 1 FSR; anything else reads as
-    /// Bilinear.
+    /// The menu's stored value: 0 Bilinear, 1 FSR, 2 NIS; anything else reads
+    /// as Bilinear.
     pub fn from_pref(value: i64) -> Self {
         match value {
             1 => Self::Fsr,
+            2 => Self::Nis,
             _ => Self::Bilinear,
         }
     }
@@ -60,7 +64,8 @@ pub struct Graphics {
     pub render_scale: u32,
     /// Native `$pref::Video::Upscaler`: how that stretch happens below 100%
     /// (Bilinear unless chosen; FSR 3.1 reconstructs the scaled world at
-    /// window size instead of stretching it).
+    /// window size instead of stretching it, and NIS scales it with NVIDIA's
+    /// spatial edge-aware pass).
     pub upscaler: Upscaler,
     /// Native `$pref::Video::SoftShading` (on unless turned off): sky-tinted
     /// ambient in Unified and Dynamic lighting only.
@@ -191,11 +196,12 @@ mod tests {
         assert_eq!(graphics(&[(RENDER_SCALE, "70")]).render_scale, 70);
         assert_eq!(graphics(&[(RENDER_SCALE, "5")]).render_scale, 25);
         assert_eq!(graphics(&[(RENDER_SCALE, "400")]).render_scale, 100);
-        // Upscaler: the bilinear stretch unless FSR is chosen; out-of-range
-        // values clamp like the other video settings.
+        // Upscaler: the bilinear stretch unless FSR or NIS is chosen;
+        // out-of-range values clamp like the other video settings.
         assert_eq!(graphics(&[]).upscaler, Upscaler::Bilinear);
         assert_eq!(graphics(&[(UPSCALER, "1")]).upscaler, Upscaler::Fsr);
-        assert_eq!(graphics(&[(UPSCALER, "7")]).upscaler, Upscaler::Fsr);
+        assert_eq!(graphics(&[(UPSCALER, "2")]).upscaler, Upscaler::Nis);
+        assert_eq!(graphics(&[(UPSCALER, "7")]).upscaler, Upscaler::Nis);
         assert!(!graphics(&[]).brick_shadows);
         assert!(graphics(&[(BRICK_SHADOWS, "1")]).brick_shadows);
         assert_eq!(graphics(&[]).shadows, Some(ShadowSettings::BEST));

@@ -200,15 +200,16 @@ pub fn render_scale(p: &Prefs) -> u32 {
 }
 /// Not a v20 setting: how the world is stretched over the window when Render
 /// Scale draws fewer pixels than it does; 0 Bilinear (the interface's own
-/// stretch), 1 FSR 3.1 (AMD's temporal reconstruction, `vendor/wgpu-ffx`).
+/// stretch), 1 FSR 3.1 (AMD's temporal reconstruction, `vendor/wgpu-ffx`),
+/// 2 NIS (NVIDIA's spatial edge-aware scaling, `vendor/nvidia-image-scaling`).
 /// The client's graphics settings read it.
 pub const UPSCALER: &str = "$pref::Video::Upscaler";
 const UPSCALER_MENU: &str = "OptGraphicsUpscalerMenu";
 /// The menu's modes and the `$pref::Video::Upscaler` value each saves.
-const UPSCALER_CHOICES: [(&str, i64); 2] = [("Bilinear", 0), ("FSR 3.1", 1)];
-/// The upscaler `$pref::Video::Upscaler` asks for (0 Bilinear, 1 FSR).
+const UPSCALER_CHOICES: [(&str, i64); 3] = [("Bilinear", 0), ("FSR 3.1", 1), ("NIS", 2)];
+/// The upscaler `$pref::Video::Upscaler` asks for (0 Bilinear, 1 FSR, 2 NIS).
 pub fn upscaler(p: &Prefs) -> i64 {
-    p.i64_or(UPSCALER, 0).clamp(0, 1)
+    p.i64_or(UPSCALER, 0).clamp(0, 2)
 }
 /// Not a v20 setting: music bricks' volume (v20 only had Play Music).
 pub const MUSIC_VOLUME: &str = "$pref::Audio::musicVolume";
@@ -2738,7 +2739,7 @@ impl Options {
             .id(UPSCALER_MENU)
             .and_then(|n| self.view.selected(n))
         {
-            self.draft.set(UPSCALER, mode.clamp(0, 1).to_string());
+            self.draft.set(UPSCALER, mode.clamp(0, 2).to_string());
         }
         if let Some(scale) = self
             .view
@@ -4125,7 +4126,7 @@ mod tests {
             .iter()
             .map(|(t, _)| t.as_str())
             .collect();
-        assert_eq!(items, ["Bilinear", "FSR 3.1"]);
+        assert_eq!(items, ["Bilinear", "FSR 3.1", "NIS"]);
         // The row sits under Render Scale, inside Display Settings, and its
         // label ends before the menu starts.
         let parent = s.view.node(menu).parent.unwrap();
@@ -4144,9 +4145,18 @@ mod tests {
         click(&mut s, "done", &mut ui);
         let saved = saved_prefs(&mut ui);
         assert_eq!(upscaler(&saved), 1);
-        let s = Options::new(&ui.core);
+        let mut s = Options::new(&ui.core);
         let menu = s.view.id(UPSCALER_MENU).unwrap();
         assert_eq!(s.view.selected_text(menu).as_deref(), Some("FSR 3.1"));
+        // The third choice survives Done too (collect clamps to the full range).
+        s.view.select(menu, Some(2));
+        change(&mut s, &mut ui, menu);
+        click(&mut s, "done", &mut ui);
+        let saved = saved_prefs(&mut ui);
+        assert_eq!(upscaler(&saved), 2);
+        let s = Options::new(&ui.core);
+        let menu = s.view.id(UPSCALER_MENU).unwrap();
+        assert_eq!(s.view.selected_text(menu).as_deref(), Some("NIS"));
     }
 
     #[test]
