@@ -1662,6 +1662,9 @@ impl Options {
         s.refresh_binds(core);
         s.smart_toggle();
         s.refresh_game_ui(core);
+        // v20's Display Settings predates Render Scale and Upscaler; fit its
+        // rows to their text now that every menu holds its items.
+        s.fit_display_menu_rows(&core.pack);
         s
     }
 
@@ -2253,12 +2256,8 @@ impl Options {
                     l.name = None;
                     l.text = Some(text.into());
                     l.position[1] = y + (menu.extent[1] - l.extent[1]) / 2;
-                    // The longest label starts further left so it ends
-                    // where the others do, short of its menu.
-                    if name == RENDER_SCALE_MENU || name == REFLECTIONS_MENU {
-                        l.extent[0] = l.extent[0].max(74);
-                        l.position[0] = l.position[0].min(menu.position[0] - l.extent[0] - 2);
-                    }
+                    // Labels and values are sized to their text by
+                    // fit_display_menu_rows once the menus hold their items.
                     v.add(parent, l);
                     v.add(parent, m);
                     // Keep all eight menu rows above Done, including the
@@ -2338,6 +2337,78 @@ impl Options {
         if let Some(n) = self.view.id(name) {
             self.view.state(n).items = items;
             self.view.select(n, Some(selected));
+        }
+    }
+    /// v20 authored Display Settings before Render Scale and Upscaler
+    /// existed, so its value column is only as wide as "1920 x 1080" and
+    /// clips their longer entries ("Performance" runs past it). Once every
+    /// menu holds its items - the end of `new` - size the eight rows to the
+    /// widest entry they can show: the popup keeps four pixels left of text
+    /// and sixteen for its arrow. Each label gets room for its own text,
+    /// right-aligned a hair short of that column.
+    fn fit_display_menu_rows(&mut self, pack: &Pack) {
+        const ROWS: [&str; 8] = [
+            QUALITY_MENU,
+            LIGHTING_MENU,
+            REFLECTIONS_MENU,
+            RENDER_SCALE_MENU,
+            UPSCALER_MENU,
+            MAX_FPS_MENU,
+            UI_SCALE_MENU,
+            COLOR_VISION_MENU,
+        ];
+        let menus: Vec<NodeId> = ROWS.iter().filter_map(|name| self.view.id(name)).collect();
+        if menus.len() != ROWS.len() || !menus.iter().all(|&m| self.view.is_shown(m)) {
+            return;
+        }
+        // The widest entry any row can show, in that row's own profile font.
+        let mut widest = 0i32;
+        for &m in &menus {
+            let style = self.view.node(m).ctrl.style.clone();
+            for (text, _) in self.view.state(m).items.iter() {
+                widest = widest.max(crate::view::View::profile_text_width(pack, &style, text));
+            }
+        }
+        if widest <= 0 {
+            return; // no profile fonts to measure against
+        }
+        let column = (widest + 20).max(84);
+        for &m in &menus {
+            let Some(parent) = self.view.node(m).parent else { continue };
+            let cap =
+                self.view.node(parent).ctrl.extent[0] - 6 - self.view.node(m).ctrl.position[0];
+            let current = self.view.nodes[m].ctrl.extent[0];
+            self.view.nodes[m].ctrl.extent[0] = column.max(current).min(cap);
+        }
+        for &m in &menus {
+            let Some(parent) = self.view.node(m).parent else { continue };
+            let menu_x = self.view.node(m).ctrl.position[0];
+            let Some(&l) = self
+                .view
+                .node(parent)
+                .children
+                .iter()
+                .find(|&&k| {
+                    self.view.node(k).ctrl.class == "GuiTextCtrl"
+                        && labels(&self.view.node(k).ctrl, &self.view.node(m).ctrl)
+                })
+            else {
+                continue;
+            };
+            let text = self.view.text_of(l);
+            let style = self.view.node(l).ctrl.style.clone();
+            let w = crate::view::View::profile_text_width(pack, &style, &text);
+            if w <= 0 {
+                continue;
+            }
+            let need = (w + 2).max(self.view.nodes[l].ctrl.extent[0]);
+            let x = self.view.nodes[l].ctrl.position[0];
+            self.view.nodes[l].ctrl.extent[0] = need;
+            // Right-align the label a hair short of the value column, but
+            // never past the section's left edge: test packs author the
+            // menu close to that edge and leave no room for wide labels.
+            let target = (menu_x - need - 2).max(0);
+            self.view.nodes[l].ctrl.position[0] = x.min(target);
         }
     }
     /// Fill the Voice menus: the microphones (Default first, then the
@@ -4228,7 +4299,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let s = Options::new(&ui.core);
+        let mut s = Options::new(&ui.core);
         let menu = s.view.id(RENDER_SCALE_MENU).unwrap();
         let parent = s.view.node(menu).parent.unwrap();
         let row = &s.view.node(menu).ctrl;
@@ -4269,6 +4340,58 @@ mod tests {
             .node(s.view.id("OptGraphicsResolutionMenu").unwrap())
             .ctrl;
         assert!(button.position[0] >= menu.position[0] + menu.extent[0]);
+        // No label or value clips: every row's column fits its widest entry
+        // (the popup keeps four pixels left of text and sixteen for its
+        // arrow), and each label fits its own text.
+        let rows = [
+            QUALITY_MENU,
+            LIGHTING_MENU,
+            REFLECTIONS_MENU,
+            RENDER_SCALE_MENU,
+            UPSCALER_MENU,
+            MAX_FPS_MENU,
+            UI_SCALE_MENU,
+            COLOR_VISION_MENU,
+        ];
+        for name in rows {
+            let m = s.view.id(name).unwrap();
+            let style = s.view.node(m).ctrl.style.clone();
+            let widest = s
+                .view
+                .state(m)
+                .items
+                .iter()
+                .map(|(t, _)| crate::view::View::profile_text_width(&ui.core.pack, &style, t))
+                .max()
+                .unwrap_or(0);
+            assert!(s.view.node(m).ctrl.extent[0] - 20 >= widest, "{name}: {widest}");
+        }
+        let section = s
+            .view
+            .node(s.view.id(RENDER_SCALE_MENU).unwrap())
+            .parent
+            .unwrap();
+        for name in rows {
+            let m = s.view.id(name).unwrap();
+            let mc = &s.view.node(m).ctrl;
+            if let Some(&l) = s
+                .view
+                .node(section)
+                .children
+                .iter()
+                .find(|&&k| {
+                    s.view.node(k).ctrl.class == "GuiTextCtrl" && labels(&s.view.node(k).ctrl, mc)
+                })
+            {
+                let lc = &s.view.node(l).ctrl;
+                let w = crate::view::View::profile_text_width(
+                    &ui.core.pack,
+                    &lc.style,
+                    &lc.text.clone().unwrap_or_default(),
+                );
+                assert!(w == 0 || lc.extent[0] >= w, "{name} label {lc:?}");
+            }
+        }
     }
 
     /// Unified and Unified+Shine are one mode: a saved Unified (1) or
