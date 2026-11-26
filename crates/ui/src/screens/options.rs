@@ -2217,7 +2217,9 @@ impl Options {
                 c.variable = Some(var.into());
                 c.text = Some(text.into());
                 c.position = [TOGGLE_MARGIN + col * column, top + row * (c.extent[1] - 3)];
-                below = c.position[1] + c.extent[1] + 8;
+                // Four pixels to the first menu row: enough breathing room
+                // for all eight rows to stay above Done.
+                below = c.position[1] + c.extent[1] + 4;
                 v.add(parent, c.clone());
             }
             // Quality presets and the frame-rate cap follow as menu rows
@@ -2261,8 +2263,8 @@ impl Options {
                     v.add(parent, l);
                     v.add(parent, m);
                     // Keep all eight menu rows above Done, including the
-                    // shading toggles. Two pixels still separate controls.
-                    y += menu.extent[1] + 2;
+                    // shading toggles. One pixel separates the popups.
+                    y += menu.extent[1] + 1;
                 }
             }
         }
