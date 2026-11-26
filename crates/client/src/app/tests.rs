@@ -2465,13 +2465,24 @@ fn fsr_upscaler_reconstructs_the_scaled_world_at_window_size() -> anyhow::Result
 
 #[test]
 fn nis_upscaler_reconstructs_the_scaled_world_at_window_size() -> anyhow::Result<()> {
+    nis_upscaler_reconstructs_at(wgpu::TextureFormat::Rgba8Unorm)
+}
+
+/// The windowed game on Linux draws into a Bgra8Unorm surface, which the
+/// pass's blit must handle (the compute side is format-agnostic; only the
+/// blit's colour attachment changes).
+#[test]
+fn nis_upscaler_reconstructs_on_a_bgra_surface() -> anyhow::Result<()> {
+    nis_upscaler_reconstructs_at(wgpu::TextureFormat::Bgra8Unorm)
+}
+
+fn nis_upscaler_reconstructs_at(format: wgpu::TextureFormat) -> anyhow::Result<()> {
     use super::*;
     const SIZE: (u32, u32) = (320, 240);
     let f = ContentRoot::synthetic()?;
     let state = f.state()?;
     let mut app = App::load(&f.root, state.path(), SIZE)?;
     let gpu = bri_ui::gpu::Headless::new()?;
-    let format = wgpu::TextureFormat::Rgba8Unorm;
     app.gpu_ready(&gpu.device, &gpu.queue, format)?;
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("nis test frame"),
