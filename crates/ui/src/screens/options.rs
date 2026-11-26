@@ -193,7 +193,19 @@ pub fn lighting(p: &Prefs) -> i64 {
 /// full size. The client's graphics settings read it.
 pub const RENDER_SCALE: &str = "$pref::Video::RenderScale";
 const RENDER_SCALE_MENU: &str = "OptGraphicsRenderScaleMenu";
-const RENDER_SCALE_CHOICES: [i64; 4] = [100, 85, 70, 50];
+/// The menu's choices, highest first. A value set in the console that is no
+/// choice still renders and lists itself as a percent.
+const RENDER_SCALE_CHOICES: [i64; 4] = [100, 85, 75, 50];
+/// A choice's menu label (anything else lists itself as a percent).
+fn render_scale_label(p: i64) -> String {
+    match p {
+        100 => "Native".into(),
+        85 => "Quality".into(),
+        75 => "Balanced".into(),
+        50 => "Performance".into(),
+        _ => format!("{p}%"),
+    }
+}
 /// The render scale `$pref::Video::RenderScale` asks for, 25 to 100.
 pub fn render_scale(p: &Prefs) -> u32 {
     p.i64_or(RENDER_SCALE, 100).clamp(25, 100) as u32
@@ -1609,7 +1621,7 @@ impl Options {
             .iter()
             .copied()
             .chain((!RENDER_SCALE_CHOICES.contains(&scale)).then_some(scale))
-            .map(|p| (format!("{p}%"), p))
+            .map(|p| (render_scale_label(p), p))
             .collect();
         s.menu(RENDER_SCALE_MENU, scale_items, scale);
         // Every value `upscaler` can return is a choice, so no chain.
@@ -4074,7 +4086,7 @@ mod tests {
         let mut ui = fixture();
         let mut s = Options::new(&ui.core);
         let menu = s.view.id(RENDER_SCALE_MENU).unwrap();
-        assert_eq!(s.view.selected_text(menu).as_deref(), Some("100%"));
+        assert_eq!(s.view.selected_text(menu).as_deref(), Some("Native"));
         let items: Vec<&str> = s
             .view
             .node(menu)
@@ -4083,7 +4095,7 @@ mod tests {
             .iter()
             .map(|(t, _)| t.as_str())
             .collect();
-        assert_eq!(items, ["100%", "85%", "70%", "50%"]);
+        assert_eq!(items, ["Native", "Quality", "Balanced", "Performance"]);
         // The row sits under Lighting, inside Display Settings, and its
         // label ends before the menu starts.
         let parent = s.view.node(menu).parent.unwrap();
@@ -4096,15 +4108,15 @@ mod tests {
         assert!(row.position[1] >= lighting.position[1] + lighting.extent[1]);
         // Render Scale is not part of a Quality preset.
         let quality = s.view.id(QUALITY_MENU).unwrap();
-        s.view.select(menu, Some(70));
+        s.view.select(menu, Some(75));
         change(&mut s, &mut ui, menu);
         assert_eq!(s.view.selected_text(quality).as_deref(), Some("High"));
         click(&mut s, "done", &mut ui);
         let saved = saved_prefs(&mut ui);
-        assert_eq!(render_scale(&saved), 70);
+        assert_eq!(render_scale(&saved), 75);
         let s = Options::new(&ui.core);
         let menu = s.view.id(RENDER_SCALE_MENU).unwrap();
-        assert_eq!(s.view.selected_text(menu).as_deref(), Some("70%"));
+        assert_eq!(s.view.selected_text(menu).as_deref(), Some("Balanced"));
         // A value set in the console is listed as itself.
         ui.core.prefs.set(RENDER_SCALE, "60");
         let s = Options::new(&ui.core);
