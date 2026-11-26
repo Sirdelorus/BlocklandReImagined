@@ -21,6 +21,23 @@
 
 use bri_console::Clamp;
 
+/// The embedded NVScaler SPIR-V, re-aligned to 4 bytes. `include_bytes!`
+/// embeds a `[u8; N]` with alignment 1, and the linker may place it at an
+/// address that is not 4-byte aligned (which happens in release builds), so
+/// `bytemuck::cast_slice::<_, u32>` would panic. Wrapping it in an align(4)
+/// container guarantees the words are aligned — the same trick wgpu-ffx-
+/// shaders-spv uses for FSR's embedded SPIR-V.
+#[repr(align(4))]
+struct Align4<const N: usize>([u8; N]);
+
+static NIS_MAIN_SPV: &[u8] = &(Align4::<{include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../vendor/nvidia-image-scaling/NIS_Main.spv",
+)).len()}>(*include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../vendor/nvidia-image-scaling/NIS_Main.spv",
+))).0);
+
 /// NVScaler's sharpness on the SDK's 0..=1 slider (0: no sharpening, 0.5:
 /// NVIDIA's reference middle). Fixed for now; a graphics option is a
 /// follow-up if playtests want it.
@@ -375,10 +392,7 @@ impl Nis {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("NIS NVScaler"),
             source: wgpu::ShaderSource::SpirV(std::borrow::Cow::Borrowed(
-                bytemuck::cast_slice(include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../vendor/nvidia-image-scaling/NIS_Main.spv",
-                ))),
+                bytemuck::cast_slice(NIS_MAIN_SPV),
             )),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
